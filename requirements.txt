@@ -1,6 +1,8 @@
 Django==6.0.4
 djangorestframework==3.16.1
 djangorestframework-simplejwt==5.3.0
+# simplejwt still imports pkg_resources; slim images omit setuptools by default.
+setuptools<81
 drf-spectacular==0.27.1
 psycopg[binary]>=3.2,<4
 psycopg2-binary>=2.9,<3
