@@ -2,7 +2,6 @@ pipeline {
     agent any
 
     environment {
-        PROJECT_DIR = "attendance_service"
         APP_NAME = "hrms-attendance-prod"
         IMAGE_NAME = "hrms-attendance-backend"
         ENV_ID = "hrms_attendance_env"
@@ -27,12 +26,20 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 withCredentials([file(credentialsId: "${ENV_ID}", variable: 'HRMS_ENV_FILE')]) {
-                    sh """
-                        cd ${PROJECT_DIR}
-                        cp "\$HRMS_ENV_FILE" ${ENV_FILE}
-                        echo "${ENV_FILE} refreshed from Jenkins credential ${ENV_ID}"
-                        docker build -f Dockerfile.prod -t ${IMAGE_NAME}:${BUILD_NUMBER} -t ${IMAGE_NAME}:latest .
-                    """
+                    sh '''
+                        if [ -f Dockerfile.prod ]; then
+                          APP_ROOT=.
+                        elif [ -f attendance_service/Dockerfile.prod ]; then
+                          APP_ROOT=attendance_service
+                        else
+                          echo "Dockerfile.prod not found at repo root or attendance_service/"
+                          exit 1
+                        fi
+                        cd "$APP_ROOT"
+                        cp "$HRMS_ENV_FILE" .env
+                        echo ".env refreshed from Jenkins credential hrms_attendance_env (cwd=$(pwd))"
+                        docker build -f Dockerfile.prod -t hrms-attendance-backend:${BUILD_NUMBER} -t hrms-attendance-backend:latest .
+                    '''
                 }
             }
         }
@@ -40,11 +47,12 @@ pipeline {
         stage('Validate App') {
             steps {
                 withCredentials([file(credentialsId: "${ENV_ID}", variable: 'HRMS_ENV_FILE')]) {
-                    sh """
-                        cd ${PROJECT_DIR}
-                        cp "\$HRMS_ENV_FILE" ${ENV_FILE}
-                        docker run --rm --env-file ${ENV_FILE} -e ALLOWED_HOSTS="${ALLOWED_HOSTS_VALUE}" ${IMAGE_NAME}:${BUILD_NUMBER} python manage.py check
-                    """
+                    sh '''
+                        if [ -f Dockerfile.prod ]; then APP_ROOT=.; elif [ -f attendance_service/Dockerfile.prod ]; then APP_ROOT=attendance_service; else exit 1; fi
+                        cd "$APP_ROOT"
+                        cp "$HRMS_ENV_FILE" .env
+                        docker run --rm --env-file .env -e ALLOWED_HOSTS="127.0.0.1,localhost,nexus-hrms.aspune.cloud" hrms-attendance-backend:${BUILD_NUMBER} python manage.py check
+                    '''
                 }
             }
         }
@@ -52,18 +60,19 @@ pipeline {
         stage('Deploy') {
             steps {
                 withCredentials([file(credentialsId: "${ENV_ID}", variable: 'HRMS_ENV_FILE')]) {
-                    sh """
-                        cd ${PROJECT_DIR}
-                        cp "\$HRMS_ENV_FILE" ${ENV_FILE}
-                        docker rm -f ${APP_NAME} || true
-                        docker run -d \\
-                          --name ${APP_NAME} \\
-                          --restart unless-stopped \\
-                          --env-file ${ENV_FILE} \\
-                          -e ALLOWED_HOSTS="${ALLOWED_HOSTS_VALUE}" \\
-                          -p ${HOST_PORT}:${CONTAINER_PORT} \\
-                          ${IMAGE_NAME}:${BUILD_NUMBER}
-                    """
+                    sh '''
+                        if [ -f Dockerfile.prod ]; then APP_ROOT=.; elif [ -f attendance_service/Dockerfile.prod ]; then APP_ROOT=attendance_service; else exit 1; fi
+                        cd "$APP_ROOT"
+                        cp "$HRMS_ENV_FILE" .env
+                        docker rm -f hrms-attendance-prod || true
+                        docker run -d \
+                          --name hrms-attendance-prod \
+                          --restart unless-stopped \
+                          --env-file .env \
+                          -e ALLOWED_HOSTS="127.0.0.1,localhost,nexus-hrms.aspune.cloud" \
+                          -p 6015:8000 \
+                          hrms-attendance-backend:${BUILD_NUMBER}
+                    '''
                 }
             }
         }

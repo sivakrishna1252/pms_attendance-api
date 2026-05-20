@@ -24,6 +24,18 @@ CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:6012,https://nexus-h
 
 Adjust `CORS_ALLOWED_ORIGINS` to every **browser origin** that will call this API (exact scheme/host/port). If your DNS hostname differs from `nexus-hrms.aspune.cloud`, add it to `ALLOWED_HOSTS` and CORS.
 
+## Jenkins credential (required)
+
+The pipeline loads production `.env` from a Jenkins **Secret file** credential. Create it once on the Jenkins server:
+
+1. **Manage Jenkins** → **Credentials** → **System** → **Global credentials** → **Add Credentials**
+2. Kind: **Secret file**
+3. **ID:** `hrms_attendance_env` (must match `ENV_ID` in `Jenkinsfile`)
+4. **File:** upload a production `.env` (copy from `.env.example`, set `DEBUG=False`, DB, `JWT_SECRET`, CORS, SMTP, etc.)
+5. Use `DB_USER` (not `DB_USERNAME`). DB name on server is `attendace_pms` if that database already exists.
+
+PMS uses the same pattern with credential ID `pms_backend_env`.
+
 ## Deploy
 
 **Docker Compose:**
