@@ -59,7 +59,7 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": config("DB_NAME", default="attendance_pms"),
-        "USER": config("DB_USER", default="postgres"),
+        "USER": config("DB_USER", default="") or config("DB_USERNAME", default="postgres"),
         "PASSWORD": config("DB_PASSWORD", default="siva"),
         "HOST": config("DB_HOST", default="127.0.0.1"),
         "PORT": config("DB_PORT", default="5432"),

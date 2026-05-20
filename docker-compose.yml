@@ -1,0 +1,3 @@
+# Default entrypoint for `docker compose up` (same stack as production).
+include:
+  - docker-compose.prod.yml
