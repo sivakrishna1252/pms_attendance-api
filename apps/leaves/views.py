@@ -7,6 +7,7 @@ from rest_framework.views import APIView
 
 from apps.attendance.views import employee_id_from_request
 from apps.authentication.permissions import IsAttendanceAdmin
+from apps.common.employee_profiles import resolver_from_request
 
 from .models import Holiday, LeaveBalance, LeaveRequest
 from .serializers import HolidaySerializer, LeaveApprovalSerializer, LeaveBalanceSerializer, LeaveRequestSerializer
@@ -68,16 +69,22 @@ def balance_cards(balance):
     ]
 
 
-def leave_card(leave_request):
+def leave_card(leave_request, resolver=None):
+    employee = (
+        resolver.employee_block(leave_request.employee_id)
+        if resolver
+        else {
+            "id": leave_request.employee_id,
+            "name": f"Employee {leave_request.employee_id}",
+            "department": "—",
+            "initials": f"E{leave_request.employee_id}",
+            "email": "",
+        }
+    )
     return {
         "id": leave_request.id,
         "employee_id": leave_request.employee_id,
-        "employee": {
-            "id": leave_request.employee_id,
-            "name": f"Employee {leave_request.employee_id}",
-            "department": "Not synced",
-            "initials": f"E{leave_request.employee_id}",
-        },
+        "employee": employee,
         "leave_type": leave_request.leave_type,
         "leave_type_label": leave_type_label(leave_request.leave_type),
         "date_range": f"{leave_request.from_date.strftime('%b %d')} - {leave_request.to_date.strftime('%b %d, %Y')}",
@@ -214,13 +221,14 @@ class PendingLeaveRequestsAPIView(APIView):
         responses={200: LeaveRequestSerializer(many=True)},
     )
     def get(self, request):
+        resolver = resolver_from_request(request)
         leave_requests = LeaveRequest.objects.filter(status=LeaveRequest.Status.PENDING)
         return Response(
             {
                 "success": True,
                 "message": "Pending leave requests fetched successfully.",
                 "pending_count": leave_requests.count(),
-                "requests": [leave_card(item) for item in leave_requests],
+                "requests": [leave_card(item, resolver) for item in leave_requests],
             }
         )
 
@@ -233,6 +241,7 @@ class AdminLeaveListAPIView(APIView):
         summary="List leave requests by status",
     )
     def get(self, request):
+        resolver = resolver_from_request(request)
         status_filter = (request.query_params.get("status") or "").upper()
         leave_requests = LeaveRequest.objects.all().order_by("-created_at")
         if status_filter in LeaveRequest.Status.values:
@@ -251,7 +260,7 @@ class AdminLeaveListAPIView(APIView):
                 "success": True,
                 "message": "Leave requests fetched successfully.",
                 "counts": counts,
-                "requests": [leave_card(item) for item in leave_requests[:200]],
+                "requests": [leave_card(item, resolver) for item in leave_requests[:200]],
             }
         )
 
@@ -267,6 +276,7 @@ class ApproveLeaveAPIView(APIView):
         responses={200: LeaveRequestSerializer},
     )
     def post(self, request, pk):
+        resolver = resolver_from_request(request)
         leave_request = LeaveRequest.objects.filter(pk=pk, status=LeaveRequest.Status.PENDING).first()
         if leave_request is None:
             return Response({"detail": "Pending leave request not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -290,7 +300,7 @@ class ApproveLeaveAPIView(APIView):
             {
                 "success": True,
                 "message": "Leave request approved successfully.",
-                "data": leave_card(leave_request),
+                "data": leave_card(leave_request, resolver),
             }
         )
 
@@ -312,6 +322,7 @@ class RejectLeaveAPIView(APIView):
         ],
     )
     def post(self, request, pk):
+        resolver = resolver_from_request(request)
         leave_request = LeaveRequest.objects.filter(pk=pk, status=LeaveRequest.Status.PENDING).first()
         if leave_request is None:
             return Response({"detail": "Pending leave request not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -331,6 +342,6 @@ class RejectLeaveAPIView(APIView):
             {
                 "success": True,
                 "message": "Leave request rejected successfully.",
-                "data": leave_card(leave_request),
+                "data": leave_card(leave_request, resolver),
             }
         )

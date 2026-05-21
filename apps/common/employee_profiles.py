@@ -1,0 +1,77 @@
+from apps.common.pms_client import (
+    employee_display_name,
+    employee_email,
+    fetch_employee_profile,
+)
+
+_DEPARTMENT_LABELS = {
+    "FRONTEND": "Frontend",
+    "BACKEND": "Backend",
+    "FULLSTACK": "Fullstack",
+    "HR": "HR",
+    "SALES": "Sales",
+    "ENGINEERING": "Engineering",
+}
+
+
+def _department_label(profile):
+    raw = (profile or {}).get("department") or ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    return _DEPARTMENT_LABELS.get(upper, text.replace("_", " ").title())
+
+
+def _initials(profile, employee_id):
+    first = ((profile or {}).get("first_name") or "").strip()
+    last = ((profile or {}).get("last_name") or "").strip()
+    if first and last:
+        return f"{first[0]}{last[0]}".upper()
+    if first:
+        return first[:2].upper()
+    email = employee_email(profile)
+    if email:
+        return email[0].upper()
+    return f"E{employee_id}"
+
+
+class EmployeeProfileResolver:
+    """Resolve PMS user profile fields once per employee per request."""
+
+    def __init__(self, *, token=None):
+        self.token = token
+        self._cache = {}
+
+    def profile(self, employee_id):
+        employee_id = int(employee_id)
+        if employee_id not in self._cache:
+            self._cache[employee_id] = fetch_employee_profile(employee_id, token=self.token)
+        return self._cache[employee_id]
+
+    def display_name(self, employee_id):
+        return employee_display_name(self.profile(employee_id), employee_id)
+
+    def department_label(self, employee_id):
+        return _department_label(self.profile(employee_id))
+
+    def initials(self, employee_id):
+        return _initials(self.profile(employee_id), employee_id)
+
+    def employee_block(self, employee_id):
+        employee_id = int(employee_id)
+        profile = self.profile(employee_id)
+        name = employee_display_name(profile, employee_id)
+        department = _department_label(profile) or "—"
+        return {
+            "id": employee_id,
+            "name": name,
+            "department": department,
+            "initials": _initials(profile, employee_id),
+            "email": employee_email(profile),
+        }
+
+
+def resolver_from_request(request):
+    token = request.headers.get("Authorization")
+    return EmployeeProfileResolver(token=token)

@@ -11,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.authentication.permissions import IsAttendanceAdmin
+from apps.common.employee_profiles import resolver_from_request
 
 from .models import AttendanceLog
 from .serializers import AttendanceLogSerializer
@@ -69,11 +70,26 @@ def get_today_attendance(employee_id, *, apply_auto=True):
     return attendance
 
 
-def format_attendance_record(attendance):
+def format_attendance_record(attendance, resolver=None):
     analysis = work_analysis(attendance)
+    employee = (
+        resolver.employee_block(attendance.employee_id)
+        if resolver
+        else {
+            "id": attendance.employee_id,
+            "name": f"Employee {attendance.employee_id}",
+            "department": "—",
+            "initials": f"E{attendance.employee_id}",
+            "email": "",
+        }
+    )
     return {
         "id": attendance.id,
         "employee_id": attendance.employee_id,
+        "employee_name": employee["name"],
+        "employee_department": employee["department"],
+        "employee_initials": employee["initials"],
+        "employee": employee,
         "date": attendance.attendance_date.isoformat(),
         "day": attendance.attendance_date.strftime("%A"),
         "status": attendance.status,
@@ -409,6 +425,7 @@ class AdminAttendanceHistoryAPIView(APIView):
     )
     def get(self, request):
         process_open_attendance_records()
+        resolver = resolver_from_request(request)
         attendance = AttendanceLog.objects.all()
         employee_id = request.query_params.get("employee_id")
         start_date = parse_date(request.query_params.get("start_date", ""))
@@ -424,7 +441,9 @@ class AdminAttendanceHistoryAPIView(APIView):
         if attendance_date:
             attendance = attendance.filter(attendance_date=attendance_date)
 
-        records = [format_attendance_record(item) for item in attendance[:500]]
+        records = [
+            format_attendance_record(item, resolver) for item in attendance[:500]
+        ]
         extra_work = sum(1 for item in records if item["work_analysis"]["variance"] == "extra_work")
         less_work = sum(1 for item in records if item["work_analysis"]["variance"] == "less_work")
 
@@ -461,10 +480,13 @@ class AdminDashboardAPIView(APIView):
         from apps.leaves.models import LeaveRequest
 
         process_open_attendance_records()
+        resolver = resolver_from_request(request)
         dashboard_date = parse_date(request.query_params.get("date", "")) or timezone.localdate()
 
         today_logs = AttendanceLog.objects.filter(attendance_date=dashboard_date).order_by("-check_in_time")
-        formatted_records = [format_attendance_record(item) for item in today_logs]
+        formatted_records = [
+            format_attendance_record(item, resolver) for item in today_logs
+        ]
 
         checked_in = today_logs.filter(check_in_time__isnull=False).count()
         checked_out = today_logs.filter(check_out_time__isnull=False).count()
@@ -501,17 +523,17 @@ class AdminDashboardAPIView(APIView):
                     "approved_count": leave_counts[LeaveRequest.Status.APPROVED],
                     "rejected_count": leave_counts[LeaveRequest.Status.REJECTED],
                     "pending_requests": [
-                        leave_card(item)
+                        leave_card(item, resolver)
                         for item in LeaveRequest.objects.filter(status=LeaveRequest.Status.PENDING)[:20]
                     ],
                     "recent_approved": [
-                        leave_card(item)
+                        leave_card(item, resolver)
                         for item in LeaveRequest.objects.filter(status=LeaveRequest.Status.APPROVED).order_by(
                             "-approved_at"
                         )[:10]
                     ],
                     "recent_rejected": [
-                        leave_card(item)
+                        leave_card(item, resolver)
                         for item in LeaveRequest.objects.filter(status=LeaveRequest.Status.REJECTED).order_by(
                             "-approved_at"
                         )[:10]
