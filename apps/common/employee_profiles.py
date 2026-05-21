@@ -70,7 +70,7 @@ class EmployeeProfileResolver:
     def profile(self, employee_id):
         employee_id = int(employee_id)
         if employee_id not in self._cache:
-            self._cache[employee_id] = fetch_employee_profile(employee_id, token=self.token)
+            self._cache[employee_id] = fetch_employee_profile(employee_id)
         return self._cache[employee_id]
 
     def display_name(self, employee_id):
@@ -105,7 +105,7 @@ def seed_staff_resolver(resolver, *, token=None):
     """One PMS users list per request — avoids per-leave profile HTTP calls."""
     if resolver is None or getattr(resolver, "_staff_seeded", False):
         return
-    users = staff_users_from_pms(token=token)
+    users = staff_users_from_pms()
     if users:
         resolver.seed_from_users(users)
     resolver._staff_seeded = True

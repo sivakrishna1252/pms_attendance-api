@@ -94,8 +94,14 @@ def deduct_leave_balance(leave_request):
     balance.save(update_fields=[field_name, "updated_at"])
 
 
-def send_leave_status_email(leave_request, *, approved=True, rejection_reason=""):
-    profile = fetch_employee_profile(leave_request.employee_id)
+def send_leave_status_email(
+    leave_request,
+    *,
+    approved=True,
+    rejection_reason="",
+    profile=None,
+):
+    profile = profile if profile is not None else fetch_employee_profile(leave_request.employee_id)
     recipient = employee_email(profile)
     name = employee_display_name(profile, leave_request.employee_id)
     date_range = f"{leave_request.from_date.isoformat()} to {leave_request.to_date.isoformat()}"

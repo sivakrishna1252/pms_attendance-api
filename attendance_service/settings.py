@@ -55,16 +55,24 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "attendance_service.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": config("DB_NAME", default="attendance_pms"),
-        "USER": config("DB_USER", default="") or config("DB_USERNAME", default="postgres"),
-        "PASSWORD": config("DB_PASSWORD", default="siva"),
-        "HOST": config("DB_HOST", default="127.0.0.1"),
-        "PORT": config("DB_PORT", default="5432"),
-    }
+_default_db = {
+    "ENGINE": "django.db.backends.postgresql",
+    "NAME": config("DB_NAME", default="attendance_pms"),
+    "USER": config("DB_USER", default="") or config("DB_USERNAME", default="postgres"),
+    "PASSWORD": config("DB_PASSWORD", default="siva"),
+    "HOST": config("DB_HOST", default="127.0.0.1"),
+    "PORT": config("DB_PORT", default="5432"),
 }
+
+DATABASES = {"default": _default_db}
+
+# Optional read/write bridge to PMS DB for in-app notifications when internal HTTP API is unavailable.
+_pms_db_name = config("PMS_DB_NAME", default="pms").strip()
+if _pms_db_name:
+    DATABASES["pms"] = {
+        **_default_db,
+        "NAME": _pms_db_name,
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},

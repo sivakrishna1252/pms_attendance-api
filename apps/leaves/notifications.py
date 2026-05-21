@@ -1,3 +1,7 @@
+import logging
+
+from django.conf import settings
+
 from apps.common.email import send_attendance_email
 from apps.common.pms_client import (
     admin_users_from_pms,
@@ -8,6 +12,8 @@ from apps.common.pms_client import (
 )
 
 from .models import LeaveRequest
+
+logger = logging.getLogger(__name__)
 
 
 def _leave_type_label(value):
@@ -21,9 +27,9 @@ def _leave_date_range(leave_request):
     )
 
 
-def notify_admins_leave_submitted(leave_request, *, token=None):
+def notify_admins_leave_submitted(leave_request):
     """Bell + email for admins when an employee submits leave."""
-    profile = fetch_employee_profile(leave_request.employee_id, token=token)
+    profile = fetch_employee_profile(leave_request.employee_id)
     employee_name = employee_display_name(profile, leave_request.employee_id)
     leave_label = _leave_type_label(leave_request.leave_type)
     date_range = _leave_date_range(leave_request)
@@ -32,8 +38,13 @@ def notify_admins_leave_submitted(leave_request, *, token=None):
         "Review in Leave Management."
     )
 
-    admins = admin_users_from_pms(token=token)
+    admins = admin_users_from_pms()
     if not admins:
+        logger.warning(
+            "No admin users for leave notification (leave_id=%s). "
+            "Check PMS is running and JWT_SECRET matches PMS DJANGO_SECRET_KEY.",
+            leave_request.id,
+        )
         return
 
     notifications = [
@@ -51,7 +62,9 @@ def notify_admins_leave_submitted(leave_request, *, token=None):
         }
         for admin in admins
     ]
-    create_pms_notifications(notifications, token=token)
+    created = create_pms_notifications(notifications)
+    if created == 0:
+        logger.warning("Failed to create admin notifications for leave_id=%s", leave_request.id)
 
     subject = f"New leave request — {employee_name}"
     body = (
@@ -62,11 +75,14 @@ def notify_admins_leave_submitted(leave_request, *, token=None):
         "— Attendance System"
     )
     for admin in admins:
-        send_attendance_email(
-            subject=subject,
-            message=body,
-            recipient_email=employee_email(admin),
-        )
+        recipient = employee_email(admin)
+        if not recipient:
+            profile = fetch_employee_profile(admin["id"])
+            recipient = employee_email(profile)
+        if recipient:
+            send_attendance_email(subject=subject, message=body, recipient_email=recipient)
+        else:
+            logger.warning("No email for admin user_id=%s (leave_id=%s)", admin.get("id"), leave_request.id)
 
 
 def notify_employee_leave_decision(
@@ -74,10 +90,9 @@ def notify_employee_leave_decision(
     *,
     approved=True,
     rejection_reason="",
-    token=None,
 ):
-    """Bell notification for employee when admin approves or rejects leave."""
-    profile = fetch_employee_profile(leave_request.employee_id, token=token)
+    """Bell notification + email for employee when admin approves or rejects leave."""
+    profile = fetch_employee_profile(leave_request.employee_id)
     leave_label = _leave_type_label(leave_request.leave_type)
     date_range = _leave_date_range(leave_request)
 
@@ -91,7 +106,7 @@ def notify_employee_leave_decision(
         reason_bit = f" Reason: {rejection_reason}" if rejection_reason else ""
         message = f"Your {leave_label} leave ({date_range}) was rejected.{reason_bit}"
 
-    create_pms_notifications(
+    created = create_pms_notifications(
         [
             {
                 "user_id": leave_request.employee_id,
@@ -105,6 +120,20 @@ def notify_employee_leave_decision(
                     "approved": approved,
                 },
             }
-        ],
-        token=token,
+        ]
+    )
+    if created == 0:
+        logger.warning(
+            "Failed to create employee notification leave_id=%s user_id=%s",
+            leave_request.id,
+            leave_request.employee_id,
+        )
+
+    from .services import send_leave_status_email
+
+    send_leave_status_email(
+        leave_request,
+        approved=approved,
+        rejection_reason=rejection_reason,
+        profile=profile,
     )
