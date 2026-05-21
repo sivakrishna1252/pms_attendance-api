@@ -2,6 +2,7 @@ from apps.common.pms_client import (
     employee_display_name,
     employee_email,
     fetch_employee_profile,
+    staff_users_from_pms,
 )
 
 _DEPARTMENT_LABELS = {
@@ -98,6 +99,16 @@ class EmployeeProfileResolver:
             "initials": _initials(profile, employee_id),
             "email": employee_email(profile),
         }
+
+
+def seed_staff_resolver(resolver, *, token=None):
+    """One PMS users list per request — avoids per-leave profile HTTP calls."""
+    if resolver is None or getattr(resolver, "_staff_seeded", False):
+        return
+    users = staff_users_from_pms(token=token)
+    if users:
+        resolver.seed_from_users(users)
+    resolver._staff_seeded = True
 
 
 def resolver_from_request(request):

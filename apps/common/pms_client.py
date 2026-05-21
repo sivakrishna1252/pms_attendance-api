@@ -87,3 +87,20 @@ def fetch_all_users(*, token=None):
         page += 1
 
     return users
+
+
+def staff_users_from_pms(*, token=None):
+    """Active PMS users with Employee or BA role (excludes Admin)."""
+    staff = []
+    for user in fetch_all_users(token=token):
+        role = str(user.get("role") or "").upper()
+        status = str(user.get("status") or "ACTIVE").upper()
+        user_id = user.get("id")
+        if user_id is None:
+            continue
+        if role not in {"EMPLOYEE", "BA"}:
+            continue
+        if status != "ACTIVE":
+            continue
+        staff.append(user)
+    return staff

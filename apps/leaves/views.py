@@ -7,7 +7,7 @@ from rest_framework.views import APIView
 
 from apps.attendance.views import employee_id_from_request
 from apps.authentication.permissions import IsAttendanceAdmin
-from apps.common.employee_profiles import resolver_from_request
+from apps.common.employee_profiles import resolver_from_request, seed_staff_resolver
 
 from .models import Holiday, LeaveBalance, LeaveRequest
 from .serializers import HolidaySerializer, LeaveApprovalSerializer, LeaveBalanceSerializer, LeaveRequestSerializer
@@ -77,6 +77,7 @@ def leave_card(leave_request, resolver=None):
             "id": leave_request.employee_id,
             "name": f"Employee {leave_request.employee_id}",
             "department": "—",
+            "role": "—",
             "initials": f"E{leave_request.employee_id}",
             "email": "",
         }
@@ -221,14 +222,17 @@ class PendingLeaveRequestsAPIView(APIView):
         responses={200: LeaveRequestSerializer(many=True)},
     )
     def get(self, request):
-        resolver = resolver_from_request(request)
-        leave_requests = LeaveRequest.objects.filter(status=LeaveRequest.Status.PENDING)
+        pending = list(
+            LeaveRequest.objects.filter(status=LeaveRequest.Status.PENDING).order_by(
+                "-created_at"
+            )
+        )
         return Response(
             {
                 "success": True,
                 "message": "Pending leave requests fetched successfully.",
-                "pending_count": leave_requests.count(),
-                "requests": [leave_card(item, resolver) for item in leave_requests],
+                "pending_count": len(pending),
+                "requests": [leave_card(item, None) for item in pending],
             }
         )
 
@@ -242,6 +246,7 @@ class AdminLeaveListAPIView(APIView):
     )
     def get(self, request):
         resolver = resolver_from_request(request)
+        seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
         status_filter = (request.query_params.get("status") or "").upper()
         leave_requests = LeaveRequest.objects.all().order_by("-created_at")
         if status_filter in LeaveRequest.Status.values:
@@ -277,6 +282,7 @@ class ApproveLeaveAPIView(APIView):
     )
     def post(self, request, pk):
         resolver = resolver_from_request(request)
+        seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
         leave_request = LeaveRequest.objects.filter(pk=pk, status=LeaveRequest.Status.PENDING).first()
         if leave_request is None:
             return Response({"detail": "Pending leave request not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -323,6 +329,7 @@ class RejectLeaveAPIView(APIView):
     )
     def post(self, request, pk):
         resolver = resolver_from_request(request)
+        seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
         leave_request = LeaveRequest.objects.filter(pk=pk, status=LeaveRequest.Status.PENDING).first()
         if leave_request is None:
             return Response({"detail": "Pending leave request not found."}, status=status.HTTP_404_NOT_FOUND)

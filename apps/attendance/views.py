@@ -12,7 +12,6 @@ from rest_framework.views import APIView
 
 from apps.authentication.permissions import IsAttendanceAdmin
 from apps.common.employee_profiles import resolver_from_request
-from apps.common.pms_client import fetch_all_users
 from apps.leaves.models import LeaveRequest
 
 from .constants import LATE_CHECK_IN_HOUR, LATE_CHECK_IN_MINUTE
@@ -348,23 +347,6 @@ def format_no_checkin_record(employee_id, attendance_date, resolver):
         "work_analysis": work_analysis(None),
         "raw": None,
     }
-
-
-def staff_users_from_pms(*, token=None):
-    """Active PMS users with Employee or BA role (excludes Admin)."""
-    staff = []
-    for user in fetch_all_users(token=token):
-        role = str(user.get("role") or "").upper()
-        status = str(user.get("status") or "ACTIVE").upper()
-        user_id = user.get("id")
-        if user_id is None:
-            continue
-        if role not in {"EMPLOYEE", "BA"}:
-            continue
-        if status != "ACTIVE":
-            continue
-        staff.append(user)
-    return staff
 
 
 def annotate_attendance_day_context(record, *, on_leave_ids, wfh_ids):
