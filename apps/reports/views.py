@@ -10,7 +10,9 @@ from rest_framework.views import APIView
 
 from apps.attendance.models import AttendanceLog
 from apps.attendance.serializers import AttendanceLogSerializer
+from apps.attendance.views import parse_staff_ids_param
 from apps.authentication.permissions import IsAttendanceAdmin
+from apps.common.employee_profiles import resolver_from_request, seed_staff_resolver
 from apps.leaves.models import LeaveRequest
 from apps.leaves.serializers import LeaveRequestSerializer
 
@@ -41,6 +43,20 @@ def _format_duration(value):
 
 def _leave_days(leave):
     return max((leave.to_date - leave.from_date).days + 1, 1)
+
+
+def _employee_name(resolver, employee_id):
+    if resolver is None:
+        return f"Employee {employee_id}"
+    return resolver.display_name(employee_id)
+
+
+def _apply_employee_filters(queryset, *, employee_id=None, staff_ids=None):
+    if staff_ids:
+        return queryset.filter(employee_id__in=staff_ids)
+    if employee_id:
+        return queryset.filter(employee_id=employee_id)
+    return queryset
 
 
 def _write_csv_response(filename, columns, rows):
@@ -110,16 +126,16 @@ class AttendanceReportsAPIView(APIView):
         parameters=[
             OpenApiParameter("start_date", OpenApiTypes.DATE, description="Filter from date, example: 2026-05-01"),
             OpenApiParameter("end_date", OpenApiTypes.DATE, description="Filter to date, example: 2026-05-31"),
-            OpenApiParameter("employee_id", OpenApiTypes.INT, description="Optional PMS user id / employee id"),
+            OpenApiParameter("employee_id", OpenApiTypes.INT, description="Optional single PMS user id"),
+            OpenApiParameter(
+                "staff_ids",
+                OpenApiTypes.STR,
+                description="Comma-separated employee ids for multi-employee reports",
+            ),
             OpenApiParameter(
                 "report_type",
                 OpenApiTypes.STR,
                 description="attendance_summary, leave_summary, or combined_summary",
-            ),
-            OpenApiParameter(
-                "department",
-                OpenApiTypes.STR,
-                description="Frontend department filter. Only all/all_departments is supported until department data is synced.",
             ),
             OpenApiParameter(
                 "export",
@@ -135,8 +151,8 @@ class AttendanceReportsAPIView(APIView):
         start_date = parse_date(request.query_params.get("start_date", ""))
         end_date = parse_date(request.query_params.get("end_date", ""))
         employee_id = request.query_params.get("employee_id")
+        staff_ids = parse_staff_ids_param(request.query_params.get("staff_ids", ""))
         report_type = request.query_params.get("report_type", REPORT_TYPE_ATTENDANCE)
-        department = request.query_params.get("department", "all")
         export_format = request.query_params.get("export", "").lower()
 
         if start_date:
@@ -145,9 +161,20 @@ class AttendanceReportsAPIView(APIView):
         if end_date:
             attendance = attendance.filter(attendance_date__lte=end_date)
             leaves = leaves.filter(to_date__lte=end_date)
-        if employee_id:
-            attendance = attendance.filter(employee_id=employee_id)
-            leaves = leaves.filter(employee_id=employee_id)
+
+        attendance = _apply_employee_filters(
+            attendance,
+            employee_id=employee_id,
+            staff_ids=staff_ids,
+        )
+        leaves = _apply_employee_filters(
+            leaves,
+            employee_id=employee_id,
+            staff_ids=staff_ids,
+        )
+
+        resolver = resolver_from_request(request)
+        seed_staff_resolver(resolver)
 
         attendance_summary = attendance.aggregate(
             total_records=Count("id"),
@@ -167,7 +194,7 @@ class AttendanceReportsAPIView(APIView):
 
         if report_type == REPORT_TYPE_LEAVE:
             preview_columns = [
-                "employee_id",
+                "employee_name",
                 "leave_type",
                 "from_date",
                 "to_date",
@@ -177,7 +204,7 @@ class AttendanceReportsAPIView(APIView):
             ]
             preview_rows = [
                 {
-                    "employee_id": leave.employee_id,
+                    "employee_name": _employee_name(resolver, leave.employee_id),
                     "leave_type": leave.leave_type,
                     "from_date": leave.from_date.isoformat(),
                     "to_date": leave.to_date.isoformat(),
@@ -185,7 +212,7 @@ class AttendanceReportsAPIView(APIView):
                     "status": leave.status,
                     "applied_on": leave.created_at.date().isoformat(),
                 }
-                for leave in leaves[:200]
+                for leave in leaves.order_by("-created_at")[:200]
             ]
             report_title = "Leave Summary"
         elif report_type == REPORT_TYPE_COMBINED:
@@ -204,7 +231,7 @@ class AttendanceReportsAPIView(APIView):
         else:
             report_type = REPORT_TYPE_ATTENDANCE
             preview_columns = [
-                "employee_id",
+                "employee_name",
                 "date",
                 "status",
                 "check_in",
@@ -213,26 +240,41 @@ class AttendanceReportsAPIView(APIView):
             ]
             preview_rows = [
                 {
-                    "employee_id": log.employee_id,
+                    "employee_name": _employee_name(resolver, log.employee_id),
                     "date": log.attendance_date.isoformat(),
                     "status": log.status,
                     "check_in": log.check_in_time.isoformat() if log.check_in_time else "",
                     "check_out": log.check_out_time.isoformat() if log.check_out_time else "",
                     "work_hours": _format_duration(log.total_work_hours),
                 }
-                for log in attendance[:200]
+                for log in attendance.order_by("-attendance_date", "-check_in_time")[:200]
             ]
             report_title = "Attendance Summary"
+
+        export_column_labels = {
+            "employee_name": "Employee Name",
+            "leave_type": "Leave Type",
+            "from_date": "From Date",
+            "to_date": "To Date",
+            "days": "Days",
+            "status": "Status",
+            "applied_on": "Applied On",
+            "date": "Date",
+            "check_in": "Check In",
+            "check_out": "Check Out",
+            "work_hours": "Work Hours",
+            "metric": "Metric",
+            "value": "Value",
+        }
+        export_headers = [export_column_labels.get(col, col.replace("_", " ").title()) for col in preview_columns]
 
         if export_format in {EXPORT_FORMAT_CSV, EXPORT_FORMAT_EXCEL}:
             extension = "csv" if export_format == EXPORT_FORMAT_CSV else "xls"
             filename = f"{report_type}_{start_date or 'start'}_{end_date or 'end'}.{extension}"
-            return _write_csv_response(filename, preview_columns, preview_rows)
+            return _write_csv_response(filename, export_headers, preview_rows)
         if export_format == EXPORT_FORMAT_PDF:
             filename = f"{report_type}_{start_date or 'start'}_{end_date or 'end'}.pdf"
-            return _write_pdf_response(filename, report_title, preview_columns, preview_rows)
-
-        department_filter_supported = department.lower() in {"", "all", "all_departments", "all departments"}
+            return _write_pdf_response(filename, report_title, export_headers, preview_rows)
 
         return Response(
             {
@@ -240,9 +282,8 @@ class AttendanceReportsAPIView(APIView):
                     "start_date": start_date,
                     "end_date": end_date,
                     "employee_id": employee_id,
+                    "staff_ids": staff_ids,
                     "report_type": report_type,
-                    "department": department,
-                    "department_filter_supported": department_filter_supported,
                 },
                 "report": {
                     "title": report_title,
@@ -264,8 +305,5 @@ class AttendanceReportsAPIView(APIView):
                 },
                 "attendance": AttendanceLogSerializer(attendance[:200], many=True).data,
                 "leave_requests": LeaveRequestSerializer(leaves[:200], many=True).data,
-                "warnings": [] if department_filter_supported else [
-                    "Department filtering needs department data synced into the attendance service."
-                ],
             }
         )
