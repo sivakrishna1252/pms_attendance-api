@@ -463,24 +463,9 @@ def build_admin_day_payload(
 
     on_leave_ids, wfh_ids = leave_flags_for_date(attendance_date)
     records_by_employee = {}
-    normalized_check_in = (check_in_filter or "all").lower()
-    is_without_check_in = normalized_check_in in {
-        "without_check_in",
-        "no_check_in",
-        "not_checked_in",
-    }
-    token = auth_token or (getattr(resolver, "token", None) if resolver else None)
-    pms_staff_users = []
-    if is_without_check_in and not employee_id:
-        if staff_ids:
-            pms_staff_users = [{"id": staff_id} for staff_id in staff_ids]
-        else:
-            pms_staff_users = staff_users_from_pms(token=token)
-        if resolver and pms_staff_users:
-            resolver.seed_from_users(pms_staff_users)
 
     for attendance in today_logs:
-        record = format_attendance_record(attendance, resolver)
+        record = format_attendance_record(attendance, None)
         annotate_attendance_day_context(
             record,
             on_leave_ids=on_leave_ids,
@@ -488,13 +473,13 @@ def build_admin_day_payload(
         )
         records_by_employee[attendance.employee_id] = record
 
-    if not employee_id and not is_without_check_in:
+    if not employee_id:
         for emp_id in on_leave_ids:
             if emp_id not in records_by_employee:
                 records_by_employee[emp_id] = format_leave_only_record(
                     emp_id,
                     attendance_date,
-                    resolver,
+                    None,
                     is_wfh=False,
                 )
         for emp_id in wfh_ids:
@@ -502,21 +487,9 @@ def build_admin_day_payload(
                 records_by_employee[emp_id] = format_leave_only_record(
                     emp_id,
                     attendance_date,
-                    resolver,
+                    None,
                     is_wfh=True,
                 )
-
-    if is_without_check_in and not employee_id:
-        on_approved_leave = on_leave_ids | wfh_ids
-        for user in pms_staff_users:
-            emp_id = int(user["id"])
-            if emp_id in records_by_employee or emp_id in on_approved_leave:
-                continue
-            records_by_employee[emp_id] = format_no_checkin_record(
-                emp_id,
-                attendance_date,
-                resolver,
-            )
 
     records = sorted(
         records_by_employee.values(),
@@ -830,18 +803,6 @@ class AdminAttendanceHistoryAPIView(APIView):
     )
     def get(self, request):
         attendance_date = parse_date(request.query_params.get("date", ""))
-        if attendance_date:
-            process_open_attendance_records(
-                AttendanceLog.objects.filter(
-                    attendance_date=attendance_date,
-                    check_out_time__isnull=True,
-                    check_in_time__isnull=False,
-                ),
-                notify=False,
-            )
-        else:
-            process_open_attendance_records(notify=False)
-
         resolver = resolver_from_request(request)
         employee_id = request.query_params.get("employee_id")
         start_date = parse_date(request.query_params.get("start_date", ""))
