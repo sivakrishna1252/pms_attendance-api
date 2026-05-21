@@ -111,6 +111,99 @@ def holiday_card(holiday):
     }
 
 
+def _leave_id_from_url_kwargs(kwargs):
+    for key in ("leave_id", "pk", "id"):
+        value = kwargs.get(key)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _normalized_leave_status(leave_request):
+    return (leave_request.status or "").strip().upper()
+
+
+def _pending_leave_requests_qs():
+    return LeaveRequest.objects.filter(status__iexact=LeaveRequest.Status.PENDING)
+
+
+def _validation_error_response(exc):
+    detail = exc.detail
+    message = "Validation failed."
+    if isinstance(detail, dict):
+        for value in detail.values():
+            if isinstance(value, list) and value:
+                message = str(value[0])
+                break
+            if isinstance(value, str) and value:
+                message = value
+                break
+    elif detail:
+        message = str(detail)
+    return Response(
+        {"success": False, "message": message, "errors": detail},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+def _get_leave_for_admin_action(request, **url_kwargs):
+    leave_id = _leave_id_from_url_kwargs(url_kwargs)
+    if leave_id is None:
+        return None, Response(
+            {"success": False, "message": "Leave request id is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    leave_request = LeaveRequest.objects.filter(pk=leave_id).first()
+    if leave_request is None:
+        return None, Response(
+            {
+                "success": False,
+                "message": f"Leave request #{leave_id} was not found.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    resolver = resolver_from_request(request)
+    seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
+    current_status = _normalized_leave_status(leave_request)
+
+    if current_status == LeaveRequest.Status.APPROVED:
+        return leave_request, Response(
+            {
+                "success": True,
+                "message": "Leave request is already approved.",
+                "data": leave_card(leave_request, resolver),
+            }
+        )
+
+    if current_status == LeaveRequest.Status.REJECTED:
+        return None, Response(
+            {
+                "success": False,
+                "message": "This leave request was already rejected.",
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    if current_status != LeaveRequest.Status.PENDING:
+        return None, Response(
+            {
+                "success": False,
+                "message": (
+                    f"Leave request cannot be processed (status: {leave_request.status})."
+                ),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    if leave_request.status != LeaveRequest.Status.PENDING:
+        leave_request.status = LeaveRequest.Status.PENDING
+        leave_request.save(update_fields=["status", "updated_at"])
+
+    return leave_request, None, resolver
+
+
 class ApplyLeaveAPIView(APIView):
     @extend_schema(
         tags=["Leaves"],
@@ -222,11 +315,7 @@ class PendingLeaveRequestsAPIView(APIView):
         responses={200: LeaveRequestSerializer(many=True)},
     )
     def get(self, request):
-        pending = list(
-            LeaveRequest.objects.filter(status=LeaveRequest.Status.PENDING).order_by(
-                "-created_at"
-            )
-        )
+        pending = list(_pending_leave_requests_qs().order_by("-created_at"))
         return Response(
             {
                 "success": True,
@@ -280,12 +369,12 @@ class ApproveLeaveAPIView(APIView):
         request=LeaveApprovalSerializer,
         responses={200: LeaveRequestSerializer},
     )
-    def post(self, request, pk):
-        resolver = resolver_from_request(request)
-        seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
-        leave_request = LeaveRequest.objects.filter(pk=pk, status=LeaveRequest.Status.PENDING).first()
-        if leave_request is None:
-            return Response({"detail": "Pending leave request not found."}, status=status.HTTP_404_NOT_FOUND)
+    def post(self, request, *args, **kwargs):
+        leave_request, error_response, resolver = _get_leave_for_admin_action(
+            request, **kwargs
+        )
+        if error_response is not None:
+            return error_response
 
         serializer = LeaveApprovalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -293,7 +382,7 @@ class ApproveLeaveAPIView(APIView):
         try:
             deduct_leave_balance(leave_request)
         except serializers.ValidationError as exc:
-            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+            return _validation_error_response(exc)
 
         leave_request.status = LeaveRequest.Status.APPROVED
         leave_request.approved_by = employee_id_from_request(request)
@@ -327,12 +416,12 @@ class RejectLeaveAPIView(APIView):
             )
         ],
     )
-    def post(self, request, pk):
-        resolver = resolver_from_request(request)
-        seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
-        leave_request = LeaveRequest.objects.filter(pk=pk, status=LeaveRequest.Status.PENDING).first()
-        if leave_request is None:
-            return Response({"detail": "Pending leave request not found."}, status=status.HTTP_404_NOT_FOUND)
+    def post(self, request, *args, **kwargs):
+        leave_request, error_response, resolver = _get_leave_for_admin_action(
+            request, **kwargs
+        )
+        if error_response is not None:
+            return error_response
 
         serializer = LeaveApprovalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

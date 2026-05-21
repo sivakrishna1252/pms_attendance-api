@@ -65,7 +65,8 @@ def validate_leave_application(*, employee_id, from_date, to_date, exclude_reque
 
 
 def deduct_leave_balance(leave_request):
-    field_name = LEAVE_TYPE_TO_BALANCE_FIELD.get(leave_request.leave_type)
+    leave_type = (leave_request.leave_type or "").strip().upper()
+    field_name = LEAVE_TYPE_TO_BALANCE_FIELD.get(leave_type)
     if not field_name:
         return
 
