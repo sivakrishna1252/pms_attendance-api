@@ -58,6 +58,14 @@ class EmployeeProfileResolver:
         self.token = token
         self._cache = {}
 
+    def seed_from_users(self, users):
+        """Preload profiles from a PMS user list (avoids per-employee HTTP calls)."""
+        for user in users or []:
+            user_id = user.get("id")
+            if user_id is None:
+                continue
+            self._cache[int(user_id)] = user
+
     def profile(self, employee_id):
         employee_id = int(employee_id)
         if employee_id not in self._cache:
