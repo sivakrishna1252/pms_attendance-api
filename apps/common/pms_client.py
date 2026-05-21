@@ -56,9 +56,7 @@ def fetch_all_users(*, token=None):
     page = 1
     page_size = 100
     while True:
-        list_url = (
-            f"{base_url.rstrip('/')}/api/v1/users/?page={page}&page_size={page_size}"
-        )
+        list_url = f"{base_url.rstrip('/')}/users/?page={page}&page_size={page_size}"
         list_request = request.Request(
             list_url,
             headers={"Authorization": authorization, "Accept": "application/json"},
@@ -69,15 +67,22 @@ def fetch_all_users(*, token=None):
         except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError):
             break
 
-        data = body.get("data") if isinstance(body, dict) else None
-        if isinstance(data, dict):
-            users.extend(data.get("results") or [])
-            meta = body.get("meta") or {}
-            total_pages = int(meta.get("total_pages") or 1)
-        else:
-            break
+        results = []
+        total_pages = 1
+        if isinstance(body, dict):
+            data = body.get("data")
+            if isinstance(data, dict):
+                results = data.get("results") or []
+                meta = body.get("meta") or {}
+                total_pages = int(meta.get("total_pages") or 1)
+            elif isinstance(data, list):
+                results = data
+            elif "results" in body:
+                results = body.get("results") or []
+                total_pages = int(body.get("total_pages") or 1)
 
-        if page >= total_pages or not (data.get("results") if isinstance(data, dict) else None):
+        users.extend(results)
+        if page >= total_pages or not results:
             break
         page += 1
 

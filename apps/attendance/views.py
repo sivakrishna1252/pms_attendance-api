@@ -436,6 +436,17 @@ def apply_status_filter(records, status_filter):
     return [item for item in records if item.get("display_status") == target]
 
 
+def parse_staff_ids_param(raw):
+    if not raw:
+        return []
+    ids = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.append(int(part))
+    return ids
+
+
 def build_admin_day_payload(
     attendance_date,
     *,
@@ -444,6 +455,7 @@ def build_admin_day_payload(
     check_in_filter="all",
     status_filter="all",
     auth_token=None,
+    staff_ids=None,
 ):
     today_logs = AttendanceLog.objects.filter(attendance_date=attendance_date).order_by("-check_in_time")
     if employee_id:
@@ -460,7 +472,10 @@ def build_admin_day_payload(
     token = auth_token or (getattr(resolver, "token", None) if resolver else None)
     pms_staff_users = []
     if is_without_check_in and not employee_id:
-        pms_staff_users = staff_users_from_pms(token=token)
+        if staff_ids:
+            pms_staff_users = [{"id": staff_id} for staff_id in staff_ids]
+        else:
+            pms_staff_users = staff_users_from_pms(token=token)
         if resolver and pms_staff_users:
             resolver.seed_from_users(pms_staff_users)
 
@@ -549,6 +564,13 @@ def build_admin_day_payload(
             "absent": absent_count,
             "leave": absent_count,
             "wfh": wfh_count,
+            "on_leave_employee_ids": sorted(on_leave_ids),
+            "wfh_employee_ids": sorted(wfh_ids),
+            "checked_in_employee_ids": sorted(
+                emp_id
+                for emp_id, item in records_by_employee.items()
+                if item.get("has_check_in")
+            ),
             "checked_out": checked_out_count,
             "still_working": still_working_count,
             "extra_work_days": extra_work_count,
@@ -807,15 +829,27 @@ class AdminAttendanceHistoryAPIView(APIView):
         responses={200: AttendanceLogSerializer(many=True)},
     )
     def get(self, request):
-        process_open_attendance_records()
+        attendance_date = parse_date(request.query_params.get("date", ""))
+        if attendance_date:
+            process_open_attendance_records(
+                AttendanceLog.objects.filter(
+                    attendance_date=attendance_date,
+                    check_out_time__isnull=True,
+                    check_in_time__isnull=False,
+                ),
+                notify=False,
+            )
+        else:
+            process_open_attendance_records(notify=False)
+
         resolver = resolver_from_request(request)
         employee_id = request.query_params.get("employee_id")
         start_date = parse_date(request.query_params.get("start_date", ""))
         end_date = parse_date(request.query_params.get("end_date", ""))
-        attendance_date = parse_date(request.query_params.get("date", ""))
         check_in_filter = request.query_params.get("check_in_filter", "all")
         status_filter = request.query_params.get("status_filter", "all")
         auth_token = request.headers.get("Authorization")
+        staff_ids = parse_staff_ids_param(request.query_params.get("staff_ids", ""))
 
         if attendance_date and not start_date and not end_date:
             day_payload = build_admin_day_payload(
@@ -825,6 +859,7 @@ class AdminAttendanceHistoryAPIView(APIView):
                 check_in_filter=check_in_filter,
                 status_filter=status_filter,
                 auth_token=auth_token,
+                staff_ids=staff_ids,
             )
             return Response(
                 {
