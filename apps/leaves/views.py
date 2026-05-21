@@ -70,6 +70,12 @@ def balance_cards(balance):
     ]
 
 
+def _balance_field_for_leave_type(leave_type):
+    from .services import LEAVE_TYPE_TO_BALANCE_FIELD
+
+    return LEAVE_TYPE_TO_BALANCE_FIELD.get((leave_type or "").strip().upper())
+
+
 def leave_card(leave_request, resolver=None):
     employee = (
         resolver.employee_block(leave_request.employee_id)
@@ -83,6 +89,15 @@ def leave_card(leave_request, resolver=None):
             "email": "",
         }
     )
+    days = leave_days(leave_request)
+    balance_field = _balance_field_for_leave_type(leave_request.leave_type)
+    balance_remaining = None
+    balance_sufficient = None
+    if balance_field:
+        balance = get_or_create_leave_balance(leave_request.employee_id)
+        balance_remaining = getattr(balance, balance_field)
+        balance_sufficient = balance_remaining >= days
+
     return {
         "id": leave_request.id,
         "employee_id": leave_request.employee_id,
@@ -92,7 +107,9 @@ def leave_card(leave_request, resolver=None):
         "date_range": f"{leave_request.from_date.strftime('%b %d')} - {leave_request.to_date.strftime('%b %d, %Y')}",
         "from_date": leave_request.from_date.isoformat(),
         "to_date": leave_request.to_date.isoformat(),
-        "days": leave_days(leave_request),
+        "days": days,
+        "balance_remaining": balance_remaining,
+        "balance_sufficient": balance_sufficient,
         "reason": leave_request.reason,
         "status": leave_request.status,
         "applied_on": leave_request.created_at.date().isoformat(),

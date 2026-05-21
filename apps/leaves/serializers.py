@@ -51,6 +51,7 @@ class LeaveRequestSerializer(serializers.ModelSerializer):
         if employee_id:
             validate_leave_application(
                 employee_id=employee_id,
+                leave_type=attrs.get("leave_type") or getattr(self.instance, "leave_type", ""),
                 from_date=attrs["from_date"],
                 to_date=attrs["to_date"],
                 exclude_request_id=self.instance.pk if self.instance else None,

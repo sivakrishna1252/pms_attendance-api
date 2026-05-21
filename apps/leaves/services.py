@@ -33,11 +33,57 @@ def holiday_dates_between(from_date, to_date):
     )
 
 
-def validate_leave_application(*, employee_id, from_date, to_date, exclude_request_id=None):
+def leave_days_between(from_date, to_date):
+    return max((to_date - from_date).days + 1, 1)
+
+
+def validate_leave_balance(*, employee_id, leave_type, from_date, to_date):
+    """Block apply/approve when requested days exceed remaining balance."""
+    field_name = LEAVE_TYPE_TO_BALANCE_FIELD.get((leave_type or "").strip().upper())
+    if not field_name:
+        return
+
+    days = leave_days_between(from_date, to_date)
+    balance, _ = LeaveBalance.objects.get_or_create(
+        employee_id=employee_id,
+        defaults={
+            "annual_leave": 18,
+            "sick_leave": 12,
+            "casual_leave": 6,
+            "compensatory_leave": 2,
+        },
+    )
+    current = getattr(balance, field_name)
+    if current < days:
+        label = field_name.replace("_", " ")
+        raise serializers.ValidationError(
+            {
+                "leave_type": [
+                    f"Insufficient {label} balance ({current} left, {days} requested)."
+                ]
+            }
+        )
+
+
+def validate_leave_application(
+    *,
+    employee_id,
+    leave_type,
+    from_date,
+    to_date,
+    exclude_request_id=None,
+):
     if to_date < from_date:
         raise serializers.ValidationError(
             {"to_date": ["To date cannot be before from date."]}
         )
+
+    validate_leave_balance(
+        employee_id=employee_id,
+        leave_type=leave_type,
+        from_date=from_date,
+        to_date=to_date,
+    )
 
     holidays = holiday_dates_between(from_date, to_date)
     if holidays:
@@ -70,7 +116,13 @@ def deduct_leave_balance(leave_request):
     if not field_name:
         return
 
-    days = max((leave_request.to_date - leave_request.from_date).days + 1, 1)
+    days = leave_days_between(leave_request.from_date, leave_request.to_date)
+    validate_leave_balance(
+        employee_id=leave_request.employee_id,
+        leave_type=leave_request.leave_type,
+        from_date=leave_request.from_date,
+        to_date=leave_request.to_date,
+    )
     balance, _ = LeaveBalance.objects.get_or_create(
         employee_id=leave_request.employee_id,
         defaults={
@@ -81,15 +133,6 @@ def deduct_leave_balance(leave_request):
         },
     )
     current = getattr(balance, field_name)
-    if current < days:
-        raise serializers.ValidationError(
-            {
-                "leave_type": [
-                    f"Insufficient {field_name.replace('_', ' ')} balance "
-                    f"({current} left, {days} requested)."
-                ]
-            }
-        )
     setattr(balance, field_name, current - days)
     balance.save(update_fields=[field_name, "updated_at"])
 
