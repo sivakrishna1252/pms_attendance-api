@@ -9,12 +9,10 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.attendance.models import AttendanceLog
-from apps.attendance.serializers import AttendanceLogSerializer
-from apps.attendance.views import parse_staff_ids_param
+from apps.attendance.views import format_time, parse_staff_ids_param
 from apps.authentication.permissions import IsAttendanceAdmin
 from apps.common.employee_profiles import resolver_from_request, seed_staff_resolver
 from apps.leaves.models import LeaveRequest
-from apps.leaves.serializers import LeaveRequestSerializer
 
 
 REPORT_TYPE_ATTENDANCE = "attendance_summary"
@@ -45,10 +43,22 @@ def _leave_days(leave):
     return max((leave.to_date - leave.from_date).days + 1, 1)
 
 
-def _employee_name(resolver, employee_id):
+def _format_date(value):
+    if not value:
+        return ""
+    return value.strftime("%d %b %Y")
+
+
+def _employee_name(resolver, employee_id, cache):
+    employee_id = int(employee_id)
+    if employee_id in cache:
+        return cache[employee_id]
     if resolver is None:
-        return f"Employee {employee_id}"
-    return resolver.display_name(employee_id)
+        name = f"Employee {employee_id}"
+    else:
+        name = resolver.display_name(employee_id)
+    cache[employee_id] = name
+    return name
 
 
 def _apply_employee_filters(queryset, *, employee_id=None, staff_ids=None):
@@ -145,52 +155,66 @@ class AttendanceReportsAPIView(APIView):
         ],
     )
     def get(self, request):
-        attendance = AttendanceLog.objects.all()
-        leaves = LeaveRequest.objects.all()
-
         start_date = parse_date(request.query_params.get("start_date", ""))
         end_date = parse_date(request.query_params.get("end_date", ""))
         employee_id = request.query_params.get("employee_id")
         staff_ids = parse_staff_ids_param(request.query_params.get("staff_ids", ""))
         report_type = request.query_params.get("report_type", REPORT_TYPE_ATTENDANCE)
         export_format = request.query_params.get("export", "").lower()
+        needs_leave_stats = report_type in {REPORT_TYPE_LEAVE, REPORT_TYPE_COMBINED}
 
+        attendance = AttendanceLog.objects.all()
         if start_date:
             attendance = attendance.filter(attendance_date__gte=start_date)
-            leaves = leaves.filter(from_date__gte=start_date)
         if end_date:
             attendance = attendance.filter(attendance_date__lte=end_date)
-            leaves = leaves.filter(to_date__lte=end_date)
-
         attendance = _apply_employee_filters(
             attendance,
             employee_id=employee_id,
             staff_ids=staff_ids,
         )
-        leaves = _apply_employee_filters(
-            leaves,
-            employee_id=employee_id,
-            staff_ids=staff_ids,
-        )
+
+        leaves = LeaveRequest.objects.none()
+        if needs_leave_stats:
+            leaves = LeaveRequest.objects.all()
+            if start_date:
+                leaves = leaves.filter(from_date__gte=start_date)
+            if end_date:
+                leaves = leaves.filter(to_date__lte=end_date)
+            leaves = _apply_employee_filters(
+                leaves,
+                employee_id=employee_id,
+                staff_ids=staff_ids,
+            )
 
         resolver = resolver_from_request(request)
         seed_staff_resolver(resolver)
+        name_cache = {}
 
         attendance_summary = attendance.aggregate(
             total_records=Count("id"),
             total_work_hours=Sum("total_work_hours"),
         )
         total_work_hours = attendance_summary["total_work_hours"] or timedelta()
-        leave_summary = leaves.values("status").annotate(total=Count("id")).order_by("status")
-        leave_days_by_status = {}
-        for leave in leaves:
-            leave_days_by_status[leave.status] = leave_days_by_status.get(leave.status, 0) + _leave_days(leave)
 
         status_counts = {
             item["status"]: item["total"]
             for item in attendance.values("status").annotate(total=Count("id")).order_by("status")
         }
-        leave_status_counts = {item["status"]: item["total"] for item in leave_summary}
+
+        leave_summary = []
+        leave_status_counts = {}
+        leave_days_by_status = {}
+        if needs_leave_stats:
+            leave_summary = list(
+                leaves.values("status").annotate(total=Count("id")).order_by("status"),
+            )
+            leave_status_counts = {item["status"]: item["total"] for item in leave_summary}
+            if report_type == REPORT_TYPE_COMBINED:
+                for leave in leaves.only("status", "from_date", "to_date"):
+                    leave_days_by_status[leave.status] = (
+                        leave_days_by_status.get(leave.status, 0) + _leave_days(leave)
+                    )
 
         if report_type == REPORT_TYPE_LEAVE:
             preview_columns = [
@@ -204,13 +228,13 @@ class AttendanceReportsAPIView(APIView):
             ]
             preview_rows = [
                 {
-                    "employee_name": _employee_name(resolver, leave.employee_id),
+                    "employee_name": _employee_name(resolver, leave.employee_id, name_cache),
                     "leave_type": leave.leave_type,
-                    "from_date": leave.from_date.isoformat(),
-                    "to_date": leave.to_date.isoformat(),
+                    "from_date": _format_date(leave.from_date),
+                    "to_date": _format_date(leave.to_date),
                     "days": _leave_days(leave),
                     "status": leave.status,
-                    "applied_on": leave.created_at.date().isoformat(),
+                    "applied_on": _format_date(leave.created_at.date()),
                 }
                 for leave in leaves.order_by("-created_at")[:200]
             ]
@@ -240,11 +264,11 @@ class AttendanceReportsAPIView(APIView):
             ]
             preview_rows = [
                 {
-                    "employee_name": _employee_name(resolver, log.employee_id),
-                    "date": log.attendance_date.isoformat(),
+                    "employee_name": _employee_name(resolver, log.employee_id, name_cache),
+                    "date": _format_date(log.attendance_date),
                     "status": log.status,
-                    "check_in": log.check_in_time.isoformat() if log.check_in_time else "",
-                    "check_out": log.check_out_time.isoformat() if log.check_out_time else "",
+                    "check_in": format_time(log.check_in_time),
+                    "check_out": format_time(log.check_out_time),
                     "work_hours": _format_duration(log.total_work_hours),
                 }
                 for log in attendance.order_by("-attendance_date", "-check_in_time")[:200]
@@ -299,11 +323,9 @@ class AttendanceReportsAPIView(APIView):
                     "total_work_hours_display": _format_duration(total_work_hours),
                     "total_work_hours_decimal": _duration_to_hours(total_work_hours),
                     "attendance_by_status": status_counts,
-                    "total_leave_requests": leaves.count(),
-                    "leave_requests_by_status": list(leave_summary),
+                    "total_leave_requests": leaves.count() if needs_leave_stats else 0,
+                    "leave_requests_by_status": leave_summary,
                     "leave_days_by_status": leave_days_by_status,
                 },
-                "attendance": AttendanceLogSerializer(attendance[:200], many=True).data,
-                "leave_requests": LeaveRequestSerializer(leaves[:200], many=True).data,
             }
         )
