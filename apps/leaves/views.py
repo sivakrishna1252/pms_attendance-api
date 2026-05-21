@@ -11,6 +11,7 @@ from apps.common.employee_profiles import resolver_from_request, seed_staff_reso
 
 from .models import Holiday, LeaveBalance, LeaveRequest
 from .serializers import HolidaySerializer, LeaveApprovalSerializer, LeaveBalanceSerializer, LeaveRequestSerializer
+from .notifications import notify_admins_leave_submitted, notify_employee_leave_decision
 from .services import (
     deduct_leave_balance,
     send_leave_status_email,
@@ -231,6 +232,10 @@ class ApplyLeaveAPIView(APIView):
         )
         serializer.is_valid(raise_exception=True)
         leave_request = serializer.save(employee_id=employee_id)
+        notify_admins_leave_submitted(
+            leave_request,
+            token=request.headers.get("Authorization"),
+        )
         balance = get_or_create_leave_balance(leave_request.employee_id)
         return Response(
             {
@@ -390,6 +395,11 @@ class ApproveLeaveAPIView(APIView):
         leave_request.rejection_reason = ""
         leave_request.save(update_fields=["status", "approved_by", "approved_at", "rejection_reason", "updated_at"])
         send_leave_status_email(leave_request, approved=True)
+        notify_employee_leave_decision(
+            leave_request,
+            approved=True,
+            token=request.headers.get("Authorization"),
+        )
 
         return Response(
             {
@@ -433,6 +443,12 @@ class RejectLeaveAPIView(APIView):
         leave_request.rejection_reason = rejection_reason
         leave_request.save(update_fields=["status", "approved_by", "approved_at", "rejection_reason", "updated_at"])
         send_leave_status_email(leave_request, approved=False, rejection_reason=rejection_reason)
+        notify_employee_leave_decision(
+            leave_request,
+            approved=False,
+            rejection_reason=rejection_reason,
+            token=request.headers.get("Authorization"),
+        )
 
         return Response(
             {

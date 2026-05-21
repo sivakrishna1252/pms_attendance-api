@@ -104,3 +104,51 @@ def staff_users_from_pms(*, token=None):
             continue
         staff.append(user)
     return staff
+
+
+def admin_users_from_pms(*, token=None):
+    """Active PMS admin users."""
+    admins = []
+    for user in fetch_all_users(token=token):
+        role = str(user.get("role") or "").upper()
+        status = str(user.get("status") or "ACTIVE").upper()
+        user_id = user.get("id")
+        if user_id is None:
+            continue
+        if role != "ADMIN":
+            continue
+        if status != "ACTIVE":
+            continue
+        admins.append(user)
+    return admins
+
+
+def create_pms_notifications(notifications, *, token=None):
+    """Create in-app notifications via PMS internal API. Returns created count."""
+    base_url = getattr(settings, "PMS_API_BASE_URL", "") or ""
+    authorization = _authorization_header(token)
+    if not base_url or not authorization or not notifications:
+        return 0
+
+    payload = json.dumps({"notifications": notifications}).encode()
+    create_request = request.Request(
+        f"{base_url.rstrip('/')}/internal/notifications/",
+        data=payload,
+        headers={
+            "Authorization": authorization,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(create_request, timeout=10) as response:
+            body = json.loads(response.read().decode())
+    except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError):
+        return 0
+
+    if isinstance(body, dict):
+        data = body.get("data") or {}
+        created_ids = data.get("created_ids") or []
+        return len(created_ids)
+    return 0
