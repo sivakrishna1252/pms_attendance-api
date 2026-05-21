@@ -7,6 +7,7 @@ class LeaveRequest(models.Model):
         SICK = "SICK", "Sick"
         CASUAL = "CASUAL", "Casual"
         COMPENSATORY = "COMPENSATORY", "Compensatory"
+        WFH = "WFH", "Work From Home"
 
     class Status(models.TextChoices):
         PENDING = "PENDING", "Pending"

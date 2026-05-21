@@ -13,6 +13,12 @@ _DEPARTMENT_LABELS = {
     "ENGINEERING": "Engineering",
 }
 
+_ROLE_LABELS = {
+    "ADMIN": "Admin",
+    "BA": "BA",
+    "EMPLOYEE": "Employee",
+}
+
 
 def _department_label(profile):
     raw = (profile or {}).get("department") or ""
@@ -21,6 +27,15 @@ def _department_label(profile):
         return ""
     upper = text.upper()
     return _DEPARTMENT_LABELS.get(upper, text.replace("_", " ").title())
+
+
+def _role_label(profile):
+    raw = (profile or {}).get("role") or ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    return _ROLE_LABELS.get(upper, text.replace("_", " ").title())
 
 
 def _initials(profile, employee_id):
@@ -55,6 +70,9 @@ class EmployeeProfileResolver:
     def department_label(self, employee_id):
         return _department_label(self.profile(employee_id))
 
+    def role_label(self, employee_id):
+        return _role_label(self.profile(employee_id))
+
     def initials(self, employee_id):
         return _initials(self.profile(employee_id), employee_id)
 
@@ -63,10 +81,12 @@ class EmployeeProfileResolver:
         profile = self.profile(employee_id)
         name = employee_display_name(profile, employee_id)
         department = _department_label(profile) or "—"
+        role = _role_label(profile) or "—"
         return {
             "id": employee_id,
             "name": name,
             "department": department,
+            "role": role,
             "initials": _initials(profile, employee_id),
             "email": employee_email(profile),
         }

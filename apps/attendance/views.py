@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from django.db import IntegrityError, transaction
 from django.db.models import Count
@@ -12,7 +12,10 @@ from rest_framework.views import APIView
 
 from apps.authentication.permissions import IsAttendanceAdmin
 from apps.common.employee_profiles import resolver_from_request
+from apps.common.pms_client import fetch_all_users
+from apps.leaves.models import LeaveRequest
 
+from .constants import LATE_CHECK_IN_HOUR, LATE_CHECK_IN_MINUTE
 from .models import AttendanceLog
 from .serializers import AttendanceLogSerializer
 from .services import (
@@ -50,6 +53,61 @@ def format_time(value):
     return timezone.localtime(value).strftime("%I:%M %p")
 
 
+def is_late_check_in(check_in_time):
+    """Late only when check-in is after 11:00 AM local time."""
+    if not check_in_time:
+        return False
+    local = timezone.localtime(check_in_time)
+    check_in_minutes = local.hour * 60 + local.minute
+    threshold_minutes = LATE_CHECK_IN_HOUR * 60 + LATE_CHECK_IN_MINUTE
+    return check_in_minutes > threshold_minutes
+
+
+def is_late_from_check_in_display(check_in_display):
+    """Parse check-in display (e.g. 12:50 PM) for late rule."""
+    text = (check_in_display or "").strip()
+    if not text or text == "-":
+        return False
+    try:
+        parsed = datetime.strptime(text, "%I:%M %p")
+    except ValueError:
+        return False
+    check_in_minutes = parsed.hour * 60 + parsed.minute
+    threshold_minutes = LATE_CHECK_IN_HOUR * 60 + LATE_CHECK_IN_MINUTE
+    return check_in_minutes > threshold_minutes
+
+
+def resolve_record_is_late(record):
+    if record.get("is_late") is True:
+        return True
+    check_in_time = record.get("check_in_time")
+    if check_in_time:
+        from django.utils.dateparse import parse_datetime
+
+        parsed = parse_datetime(check_in_time)
+        if parsed:
+            if timezone.is_naive(parsed):
+                parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+            if is_late_check_in(parsed):
+                return True
+    return is_late_from_check_in_display(record.get("check_in"))
+
+
+def apply_display_status(record):
+    status = record.get("status")
+    if status == "WFH":
+        record["display_status"] = "WFH"
+    elif status == "ON_LEAVE":
+        record["display_status"] = "Absent"
+    elif record.get("has_check_in"):
+        record["is_late"] = resolve_record_is_late(record)
+        record["display_status"] = "Late" if record["is_late"] else "Present"
+    else:
+        record["display_status"] = record.get("display_status") or "—"
+    record["status_label"] = record["display_status"]
+    return record
+
+
 def close_stale_open_sessions(employee_id):
     today = timezone.localdate()
     stale = AttendanceLog.objects.filter(
@@ -79,6 +137,7 @@ def format_attendance_record(attendance, resolver=None):
             "id": attendance.employee_id,
             "name": f"Employee {attendance.employee_id}",
             "department": "—",
+            "role": "—",
             "initials": f"E{attendance.employee_id}",
             "email": "",
         }
@@ -88,6 +147,7 @@ def format_attendance_record(attendance, resolver=None):
         "employee_id": attendance.employee_id,
         "employee_name": employee["name"],
         "employee_department": employee["department"],
+        "employee_role": employee.get("role", "—"),
         "employee_initials": employee["initials"],
         "employee": employee,
         "date": attendance.attendance_date.isoformat(),
@@ -95,10 +155,16 @@ def format_attendance_record(attendance, resolver=None):
         "status": attendance.status,
         "status_label": attendance.get_status_display(),
         "check_in": format_time(attendance.check_in_time),
+        "check_in_time": (
+            timezone.localtime(attendance.check_in_time).isoformat()
+            if attendance.check_in_time
+            else None
+        ),
         "check_out": format_time(attendance.check_out_time),
         "duration": format_duration(attendance.total_work_hours),
         "location": DEFAULT_OFFICE_LOCATION,
         "auto_checked_out": analysis["auto_checked_out"],
+        "is_late": is_late_check_in(attendance.check_in_time),
         "work_analysis": analysis,
         "raw": AttendanceLogSerializer(attendance).data,
     }
@@ -182,6 +248,311 @@ def build_history_summary(queryset):
         "checked_out": status_counts.get(AttendanceLog.Status.CHECKED_OUT, 0),
         "auto_checked_out": queryset.filter(auto_checked_out=True).count(),
         "total_records": queryset.count(),
+    }
+
+
+def approved_leaves_on_date(attendance_date):
+    return LeaveRequest.objects.filter(
+        status=LeaveRequest.Status.APPROVED,
+        from_date__lte=attendance_date,
+        to_date__gte=attendance_date,
+    )
+
+
+def leave_flags_for_date(attendance_date):
+    on_leave_ids = set()
+    wfh_ids = set()
+    for leave in approved_leaves_on_date(attendance_date).only("employee_id", "leave_type"):
+        if leave.leave_type == LeaveRequest.LeaveType.WFH:
+            wfh_ids.add(leave.employee_id)
+        else:
+            on_leave_ids.add(leave.employee_id)
+    return on_leave_ids, wfh_ids
+
+
+def format_leave_only_record(employee_id, attendance_date, resolver, *, is_wfh=False):
+    employee = (
+        resolver.employee_block(employee_id)
+        if resolver
+        else {
+            "id": employee_id,
+            "name": f"Employee {employee_id}",
+            "department": "—",
+            "role": "—",
+            "initials": f"E{employee_id}",
+            "email": "",
+        }
+    )
+    status = "WFH" if is_wfh else "ON_LEAVE"
+    status_label = "WFH" if is_wfh else "Absent"
+    return {
+        "id": None,
+        "employee_id": employee_id,
+        "employee_name": employee["name"],
+        "employee_department": employee["department"],
+        "employee_role": employee.get("role", "—"),
+        "employee_initials": employee["initials"],
+        "employee": employee,
+        "date": attendance_date.isoformat(),
+        "day": attendance_date.strftime("%A"),
+        "status": status,
+        "status_label": status_label,
+        "check_in": "-",
+        "check_out": "-",
+        "duration": "-",
+        "location": "—",
+        "auto_checked_out": False,
+        "has_check_in": False,
+        "attendance_type": "WFH" if is_wfh else "Leave",
+        "is_late": False,
+        "display_status": status_label,
+        "work_analysis": work_analysis(None),
+        "raw": None,
+    }
+
+
+def format_no_checkin_record(employee_id, attendance_date, resolver):
+    employee = (
+        resolver.employee_block(employee_id)
+        if resolver
+        else {
+            "id": employee_id,
+            "name": f"Employee {employee_id}",
+            "department": "—",
+            "role": "—",
+            "initials": f"E{employee_id}",
+            "email": "",
+        }
+    )
+    return {
+        "id": None,
+        "employee_id": employee_id,
+        "employee_name": employee["name"],
+        "employee_department": employee["department"],
+        "employee_role": employee.get("role", "—"),
+        "employee_initials": employee["initials"],
+        "employee": employee,
+        "date": attendance_date.isoformat(),
+        "day": attendance_date.strftime("%A"),
+        "status": "NOT_CHECKED_IN",
+        "status_label": "—",
+        "display_status": "—",
+        "check_in": "-",
+        "check_out": "-",
+        "duration": "-",
+        "location": "—",
+        "auto_checked_out": False,
+        "has_check_in": False,
+        "attendance_type": "—",
+        "is_late": False,
+        "work_analysis": work_analysis(None),
+        "raw": None,
+    }
+
+
+def active_employee_ids_from_pms(*, token=None):
+    ids = []
+    for user in fetch_all_users(token=token):
+        role = str(user.get("role") or "").upper()
+        status = str(user.get("status") or "ACTIVE").upper()
+        user_id = user.get("id")
+        if user_id is None:
+            continue
+        if role != "EMPLOYEE":
+            continue
+        if status != "ACTIVE":
+            continue
+        ids.append(int(user_id))
+    return ids
+
+
+def annotate_attendance_day_context(record, *, on_leave_ids, wfh_ids):
+    employee_id = record["employee_id"]
+    has_check_in = record.get("check_in") not in (None, "-", "")
+    record["has_check_in"] = has_check_in
+
+    if employee_id in wfh_ids:
+        record["status"] = "WFH"
+        record["status_label"] = "WFH"
+        record["attendance_type"] = "WFH"
+    elif employee_id in on_leave_ids and not has_check_in:
+        record["status"] = "ON_LEAVE"
+        record["status_label"] = "Absent"
+        record["attendance_type"] = "Leave"
+    elif record.get("auto_checked_out"):
+        record["attendance_type"] = "Auto checkout"
+    else:
+        record["attendance_type"] = record.get("attendance_type") or "Office"
+    return apply_display_status(record)
+
+
+def average_work_hours_summary(records):
+    hours = []
+    for record in records:
+        if not record.get("has_check_in"):
+            continue
+        if record.get("check_out") in (None, "-", ""):
+            continue
+        worked = record.get("work_analysis", {}).get("work_hours")
+        if isinstance(worked, (int, float)) and worked > 0:
+            hours.append(worked)
+    if not hours:
+        return {"avg_work_hours": 0.0, "avg_work_hours_display": "0h"}
+    avg = sum(hours) / len(hours)
+    return {
+        "avg_work_hours": round(avg, 2),
+        "avg_work_hours_display": f"{avg:.1f}h",
+    }
+
+
+def apply_check_in_filter(records, check_in_filter):
+    normalized = (check_in_filter or "all").lower()
+    if normalized in {"", "all"}:
+        return records
+    if normalized == "checked_in":
+        return [item for item in records if item.get("has_check_in")]
+    if normalized in {"without_check_in", "no_check_in", "not_checked_in"}:
+        return [
+            item
+            for item in records
+            if not item.get("has_check_in")
+            and item.get("status") not in ("ON_LEAVE", "WFH")
+        ]
+    return records
+
+
+def apply_status_filter(records, status_filter):
+    normalized = (status_filter or "all").lower()
+    targets = {
+        "late": "Late",
+        "present": "Present",
+        "absent": "Absent",
+        "wfh": "WFH",
+    }
+    target = targets.get(normalized)
+    if not target:
+        return records
+    return [item for item in records if item.get("display_status") == target]
+
+
+def build_admin_day_payload(
+    attendance_date,
+    *,
+    resolver=None,
+    employee_id=None,
+    check_in_filter="all",
+    status_filter="all",
+    auth_token=None,
+):
+    today_logs = AttendanceLog.objects.filter(attendance_date=attendance_date).order_by("-check_in_time")
+    if employee_id:
+        today_logs = today_logs.filter(employee_id=employee_id)
+
+    on_leave_ids, wfh_ids = leave_flags_for_date(attendance_date)
+    records_by_employee = {}
+
+    for attendance in today_logs:
+        record = format_attendance_record(attendance, resolver)
+        annotate_attendance_day_context(
+            record,
+            on_leave_ids=on_leave_ids,
+            wfh_ids=wfh_ids,
+        )
+        records_by_employee[attendance.employee_id] = record
+
+    if not employee_id:
+        for emp_id in on_leave_ids:
+            if emp_id not in records_by_employee:
+                records_by_employee[emp_id] = format_leave_only_record(
+                    emp_id,
+                    attendance_date,
+                    resolver,
+                    is_wfh=False,
+                )
+        for emp_id in wfh_ids:
+            if emp_id not in records_by_employee:
+                records_by_employee[emp_id] = format_leave_only_record(
+                    emp_id,
+                    attendance_date,
+                    resolver,
+                    is_wfh=True,
+                )
+
+        normalized_check_in = (check_in_filter or "all").lower()
+        if normalized_check_in in {"without_check_in", "no_check_in", "not_checked_in"}:
+            on_approved_leave = on_leave_ids | wfh_ids
+            token = auth_token or (getattr(resolver, "token", None) if resolver else None)
+            for emp_id in active_employee_ids_from_pms(token=token):
+                if emp_id in records_by_employee or emp_id in on_approved_leave:
+                    continue
+                records_by_employee[emp_id] = format_no_checkin_record(
+                    emp_id,
+                    attendance_date,
+                    resolver,
+                )
+
+    records = sorted(
+        records_by_employee.values(),
+        key=lambda item: (item.get("employee_name") or "").lower(),
+    )
+    records = apply_check_in_filter(records, check_in_filter)
+    records = apply_status_filter(records, status_filter)
+
+    checked_in_count = sum(1 for item in records_by_employee.values() if item.get("has_check_in"))
+    checked_out_count = sum(
+        1
+        for item in records_by_employee.values()
+        if item.get("check_out") not in (None, "-", "")
+    )
+    still_working_count = sum(
+        1
+        for item in records_by_employee.values()
+        if item.get("has_check_in") and item.get("check_out") in (None, "-", "")
+    )
+    extra_work_count = sum(
+        1 for item in records_by_employee.values() if item["work_analysis"]["variance"] == "extra_work"
+    )
+    less_work_count = sum(
+        1 for item in records_by_employee.values() if item["work_analysis"]["variance"] == "less_work"
+    )
+    late_count = sum(
+        1
+        for item in records_by_employee.values()
+        if item.get("display_status") == "Late" or resolve_record_is_late(item)
+    )
+
+    absent_count = len(on_leave_ids)
+    if employee_id:
+        absent_count = 1 if int(employee_id) in on_leave_ids else 0
+    wfh_count = len(wfh_ids)
+    if employee_id:
+        wfh_count = 1 if int(employee_id) in wfh_ids else 0
+
+    avg_hours = average_work_hours_summary(records_by_employee.values())
+
+    return {
+        "records": records,
+        "summary": {
+            "present": checked_in_count,
+            "absent": absent_count,
+            "leave": absent_count,
+            "wfh": wfh_count,
+            "checked_out": checked_out_count,
+            "still_working": still_working_count,
+            "extra_work_days": extra_work_count,
+            "less_work_days": less_work_count,
+            "late_check_ins": late_count,
+            **avg_hours,
+        },
+        "attendance_today": {
+            "checked_in_count": checked_in_count,
+            "checked_out_count": checked_out_count,
+            "still_working_count": still_working_count,
+            "extra_work_count": extra_work_count,
+            "less_work_count": less_work_count,
+            "late_check_ins": late_count,
+            "records": records,
+        },
     }
 
 
@@ -426,12 +797,41 @@ class AdminAttendanceHistoryAPIView(APIView):
     def get(self, request):
         process_open_attendance_records()
         resolver = resolver_from_request(request)
-        attendance = AttendanceLog.objects.all()
         employee_id = request.query_params.get("employee_id")
         start_date = parse_date(request.query_params.get("start_date", ""))
         end_date = parse_date(request.query_params.get("end_date", ""))
         attendance_date = parse_date(request.query_params.get("date", ""))
+        check_in_filter = request.query_params.get("check_in_filter", "all")
+        status_filter = request.query_params.get("status_filter", "all")
+        auth_token = request.headers.get("Authorization")
 
+        if attendance_date and not start_date and not end_date:
+            day_payload = build_admin_day_payload(
+                attendance_date,
+                resolver=resolver,
+                employee_id=employee_id,
+                check_in_filter=check_in_filter,
+                status_filter=status_filter,
+                auth_token=auth_token,
+            )
+            return Response(
+                {
+                    "success": True,
+                    "message": "Admin attendance history fetched successfully.",
+                    "filters": {
+                        "employee_id": employee_id,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "date": attendance_date,
+                        "check_in_filter": check_in_filter,
+                        "status_filter": status_filter,
+                    },
+                    "summary": day_payload["summary"],
+                    "records": day_payload["records"],
+                }
+            )
+
+        attendance = AttendanceLog.objects.all()
         if employee_id:
             attendance = attendance.filter(employee_id=employee_id)
         if start_date:
@@ -456,6 +856,7 @@ class AdminAttendanceHistoryAPIView(APIView):
                     "start_date": start_date,
                     "end_date": end_date,
                     "date": attendance_date,
+                    "check_in_filter": check_in_filter,
                 },
                 "summary": {
                     **build_history_summary(attendance),
@@ -477,20 +878,22 @@ class AdminDashboardAPIView(APIView):
     def get(self, request):
         from apps.leaves.views import leave_card
 
-        from apps.leaves.models import LeaveRequest
-
         process_open_attendance_records()
         resolver = resolver_from_request(request)
         dashboard_date = parse_date(request.query_params.get("date", "")) or timezone.localdate()
+        check_in_filter = request.query_params.get("check_in_filter", "all")
+        status_filter = request.query_params.get("status_filter", "all")
+        employee_id = request.query_params.get("employee_id")
+        auth_token = request.headers.get("Authorization")
 
-        today_logs = AttendanceLog.objects.filter(attendance_date=dashboard_date).order_by("-check_in_time")
-        formatted_records = [
-            format_attendance_record(item, resolver) for item in today_logs
-        ]
-
-        checked_in = today_logs.filter(check_in_time__isnull=False).count()
-        checked_out = today_logs.filter(check_out_time__isnull=False).count()
-        still_working = today_logs.filter(check_out_time__isnull=True, check_in_time__isnull=False).count()
+        day_payload = build_admin_day_payload(
+            dashboard_date,
+            resolver=resolver,
+            employee_id=employee_id,
+            check_in_filter=check_in_filter,
+            status_filter=status_filter,
+            auth_token=auth_token,
+        )
 
         leave_counts = {
             status: LeaveRequest.objects.filter(status=status).count()
@@ -506,18 +909,8 @@ class AdminDashboardAPIView(APIView):
                 "success": True,
                 "message": "Admin dashboard fetched successfully.",
                 "date": dashboard_date.isoformat(),
-                "attendance_today": {
-                    "checked_in_count": checked_in,
-                    "checked_out_count": checked_out,
-                    "still_working_count": still_working,
-                    "extra_work_count": sum(
-                        1 for item in formatted_records if item["work_analysis"]["variance"] == "extra_work"
-                    ),
-                    "less_work_count": sum(
-                        1 for item in formatted_records if item["work_analysis"]["variance"] == "less_work"
-                    ),
-                    "records": formatted_records,
-                },
+                "attendance_today": day_payload["attendance_today"],
+                "summary": day_payload["summary"],
                 "leaves": {
                     "pending_count": leave_counts[LeaveRequest.Status.PENDING],
                     "approved_count": leave_counts[LeaveRequest.Status.APPROVED],

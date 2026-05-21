@@ -43,3 +43,42 @@ def employee_display_name(profile, employee_id):
 
 def employee_email(profile):
     return (profile or {}).get("email") or ""
+
+
+def fetch_all_users(*, token=None):
+    """Return all PMS users (paginated list), or [] if PMS is unreachable."""
+    base_url = getattr(settings, "PMS_API_BASE_URL", "") or ""
+    authorization = _authorization_header(token)
+    if not base_url or not authorization:
+        return []
+
+    users = []
+    page = 1
+    page_size = 100
+    while True:
+        list_url = (
+            f"{base_url.rstrip('/')}/api/v1/users/?page={page}&page_size={page_size}"
+        )
+        list_request = request.Request(
+            list_url,
+            headers={"Authorization": authorization, "Accept": "application/json"},
+        )
+        try:
+            with request.urlopen(list_request, timeout=10) as response:
+                body = json.loads(response.read().decode())
+        except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError):
+            break
+
+        data = body.get("data") if isinstance(body, dict) else None
+        if isinstance(data, dict):
+            users.extend(data.get("results") or [])
+            meta = body.get("meta") or {}
+            total_pages = int(meta.get("total_pages") or 1)
+        else:
+            break
+
+        if page >= total_pages or not (data.get("results") if isinstance(data, dict) else None):
+            break
+        page += 1
+
+    return users
