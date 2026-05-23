@@ -8,12 +8,16 @@ from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.attendance.calendar import REPORT_RETENTION_MONTHS, resolve_report_date_range
 from apps.attendance.models import AttendanceLog
 from apps.attendance.views import format_time, parse_staff_ids_param
 from apps.authentication.permissions import IsAttendanceAdmin
 from apps.common.employee_profiles import resolver_from_request, seed_staff_resolver
 from apps.leaves.models import LeaveRequest
-
+from apps.reports.generators import (
+    build_attendance_report_rows,
+    build_leave_report_rows,
+)
 
 REPORT_TYPE_ATTENDANCE = "attendance_summary"
 REPORT_TYPE_LEAVE = "leave_summary"
@@ -21,6 +25,8 @@ REPORT_TYPE_COMBINED = "combined_summary"
 EXPORT_FORMAT_CSV = "csv"
 EXPORT_FORMAT_EXCEL = "excel"
 EXPORT_FORMAT_PDF = "pdf"
+PREVIEW_ROW_LIMIT = 200
+EXPORT_ROW_LIMIT = 5000
 
 
 def _duration_to_hours(value):
@@ -69,9 +75,14 @@ def _apply_employee_filters(queryset, *, employee_id=None, staff_ids=None):
     return queryset
 
 
-def _write_csv_response(filename, columns, rows):
-    response = HttpResponse(content_type="text/csv")
+def _write_csv_response(filename, columns, rows, *, excel_compatible=False):
+    content_type = "text/csv"
+    if excel_compatible:
+        content_type = "application/vnd.ms-excel"
+
+    response = HttpResponse(content_type=content_type)
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.write("\ufeff")
 
     writer = csv.writer(response)
     writer.writerow(columns)
@@ -86,12 +97,14 @@ def _escape_pdf_text(value):
 
 def _write_pdf_response(filename, title, columns, rows):
     lines = [title, "", " | ".join(columns)]
-    lines.extend(" | ".join(str(row.get(column, "")) for column in columns) for row in rows[:40])
+    lines.extend(" | ".join(str(row.get(column, "")) for column in columns) for row in rows[:120])
+    if len(rows) > 120:
+        lines.append(f"... and {len(rows) - 120} more rows. Download CSV/Excel for full data.")
 
-    content_lines = ["BT", "/F1 10 Tf", "40 780 Td"]
+    content_lines = ["BT", "/F1 9 Tf", "40 780 Td"]
     for index, line in enumerate(lines):
         if index:
-            content_lines.append("0 -16 Td")
+            content_lines.append("0 -14 Td")
         content_lines.append(f"({_escape_pdf_text(line[:115])}) Tj")
     content_lines.append("ET")
     stream = "\n".join(content_lines).encode("utf-8")
@@ -150,24 +163,25 @@ class AttendanceReportsAPIView(APIView):
             OpenApiParameter(
                 "export",
                 OpenApiTypes.STR,
-                description="Optional export format. Supported: pdf, csv, excel. Excel returns CSV-compatible data.",
+                description="Optional export format. Supported: pdf, csv, excel.",
             ),
         ],
     )
     def get(self, request):
-        start_date = parse_date(request.query_params.get("start_date", ""))
-        end_date = parse_date(request.query_params.get("end_date", ""))
+        raw_start = parse_date(request.query_params.get("start_date", ""))
+        raw_end = parse_date(request.query_params.get("end_date", ""))
+        start_date, end_date, warnings = resolve_report_date_range(raw_start, raw_end)
+
         employee_id = request.query_params.get("employee_id")
         staff_ids = parse_staff_ids_param(request.query_params.get("staff_ids", ""))
         report_type = request.query_params.get("report_type", REPORT_TYPE_ATTENDANCE)
         export_format = request.query_params.get("export", "").lower()
         needs_leave_stats = report_type in {REPORT_TYPE_LEAVE, REPORT_TYPE_COMBINED}
 
-        attendance = AttendanceLog.objects.all()
-        if start_date:
-            attendance = attendance.filter(attendance_date__gte=start_date)
-        if end_date:
-            attendance = attendance.filter(attendance_date__lte=end_date)
+        attendance = AttendanceLog.objects.filter(
+            attendance_date__gte=start_date,
+            attendance_date__lte=end_date,
+        )
         attendance = _apply_employee_filters(
             attendance,
             employee_id=employee_id,
@@ -176,11 +190,10 @@ class AttendanceReportsAPIView(APIView):
 
         leaves = LeaveRequest.objects.none()
         if needs_leave_stats:
-            leaves = LeaveRequest.objects.all()
-            if start_date:
-                leaves = leaves.filter(from_date__gte=start_date)
-            if end_date:
-                leaves = leaves.filter(to_date__lte=end_date)
+            leaves = LeaveRequest.objects.filter(
+                from_date__lte=end_date,
+                to_date__gte=start_date,
+            )
             leaves = _apply_employee_filters(
                 leaves,
                 employee_id=employee_id,
@@ -188,7 +201,7 @@ class AttendanceReportsAPIView(APIView):
             )
 
         resolver = resolver_from_request(request)
-        seed_staff_resolver(resolver)
+        seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
         name_cache = {}
 
         attendance_summary = attendance.aggregate(
@@ -226,26 +239,33 @@ class AttendanceReportsAPIView(APIView):
                 "status",
                 "applied_on",
             ]
-            preview_rows = [
-                {
-                    "employee_name": _employee_name(resolver, leave.employee_id, name_cache),
-                    "leave_type": leave.leave_type,
-                    "from_date": _format_date(leave.from_date),
-                    "to_date": _format_date(leave.to_date),
-                    "days": _leave_days(leave),
-                    "status": leave.status,
-                    "applied_on": _format_date(leave.created_at.date()),
-                }
-                for leave in leaves.order_by("-created_at")[:200]
-            ]
+            full_rows = build_leave_report_rows(
+                leaves_queryset=leaves,
+                resolver=resolver,
+                name_cache=name_cache,
+            )
             report_title = "Leave Summary"
         elif report_type == REPORT_TYPE_COMBINED:
             preview_columns = ["metric", "value"]
-            preview_rows = [
+            attendance_rows = build_attendance_report_rows(
+                start_date=start_date,
+                end_date=end_date,
+                resolver=resolver,
+                employee_id=employee_id,
+                staff_ids=staff_ids,
+                attendance_queryset=attendance,
+            )
+            status_totals = {}
+            for row in attendance_rows:
+                status_totals[row["status"]] = status_totals.get(row["status"], 0) + 1
+            full_rows = [
                 {"metric": "Attendance Records", "value": attendance_summary["total_records"]},
                 {"metric": "Total Work Hours", "value": _format_duration(total_work_hours)},
-                {"metric": "Present Records", "value": status_counts.get(AttendanceLog.Status.PRESENT, 0)},
-                {"metric": "Checked Out Records", "value": status_counts.get(AttendanceLog.Status.CHECKED_OUT, 0)},
+                {"metric": "Present Days", "value": status_totals.get("Present", 0)},
+                {"metric": "Late Days", "value": status_totals.get("Late", 0)},
+                {"metric": "Absent Days", "value": status_totals.get("Absent", 0)},
+                {"metric": "Holiday Days", "value": status_totals.get("Holiday", 0)},
+                {"metric": "WFH Days", "value": status_totals.get("WFH", 0)},
                 {"metric": "Leave Requests", "value": leaves.count()},
                 {"metric": "Approved Leaves", "value": leave_status_counts.get(LeaveRequest.Status.APPROVED, 0)},
                 {"metric": "Pending Leaves", "value": leave_status_counts.get(LeaveRequest.Status.PENDING, 0)},
@@ -257,23 +277,25 @@ class AttendanceReportsAPIView(APIView):
             preview_columns = [
                 "employee_name",
                 "date",
+                "day",
                 "status",
+                "note",
                 "check_in",
                 "check_out",
                 "work_hours",
             ]
-            preview_rows = [
-                {
-                    "employee_name": _employee_name(resolver, log.employee_id, name_cache),
-                    "date": _format_date(log.attendance_date),
-                    "status": log.status,
-                    "check_in": format_time(log.check_in_time),
-                    "check_out": format_time(log.check_out_time),
-                    "work_hours": _format_duration(log.total_work_hours),
-                }
-                for log in attendance.order_by("-attendance_date", "-check_in_time")[:200]
-            ]
+            full_rows = build_attendance_report_rows(
+                start_date=start_date,
+                end_date=end_date,
+                resolver=resolver,
+                employee_id=employee_id,
+                staff_ids=staff_ids,
+                attendance_queryset=attendance,
+            )
             report_title = "Attendance Summary"
+
+        export_rows = full_rows[:EXPORT_ROW_LIMIT]
+        preview_rows = full_rows[:PREVIEW_ROW_LIMIT]
 
         export_column_labels = {
             "employee_name": "Employee Name",
@@ -284,6 +306,8 @@ class AttendanceReportsAPIView(APIView):
             "status": "Status",
             "applied_on": "Applied On",
             "date": "Date",
+            "day": "Day",
+            "note": "Note",
             "check_in": "Check In",
             "check_out": "Check Out",
             "work_hours": "Work Hours",
@@ -294,11 +318,21 @@ class AttendanceReportsAPIView(APIView):
 
         if export_format in {EXPORT_FORMAT_CSV, EXPORT_FORMAT_EXCEL}:
             extension = "csv" if export_format == EXPORT_FORMAT_CSV else "xls"
-            filename = f"{report_type}_{start_date or 'start'}_{end_date or 'end'}.{extension}"
-            return _write_csv_response(filename, export_headers, preview_rows)
+            filename = f"{report_type}_{start_date}_{end_date}.{extension}"
+            return _write_csv_response(
+                filename,
+                export_headers,
+                export_rows,
+                excel_compatible=export_format == EXPORT_FORMAT_EXCEL,
+            )
         if export_format == EXPORT_FORMAT_PDF:
-            filename = f"{report_type}_{start_date or 'start'}_{end_date or 'end'}.pdf"
-            return _write_pdf_response(filename, report_title, export_headers, preview_rows)
+            filename = f"{report_type}_{start_date}_{end_date}.pdf"
+            return _write_pdf_response(
+                filename,
+                f"{report_title} ({start_date} - {end_date})",
+                export_headers,
+                export_rows,
+            )
 
         return Response(
             {
@@ -308,13 +342,15 @@ class AttendanceReportsAPIView(APIView):
                     "employee_id": employee_id,
                     "staff_ids": staff_ids,
                     "report_type": report_type,
+                    "retention_months": REPORT_RETENTION_MONTHS,
                 },
+                "warnings": warnings,
                 "report": {
                     "title": report_title,
-                    "preview_title": f"{report_title} ({start_date or 'All'} - {end_date or 'All'})",
+                    "preview_title": f"{report_title} ({start_date} - {end_date})",
                     "columns": preview_columns,
                     "rows": preview_rows,
-                    "row_count": len(preview_rows),
+                    "row_count": len(full_rows),
                     "export_formats": [EXPORT_FORMAT_PDF, EXPORT_FORMAT_EXCEL, EXPORT_FORMAT_CSV],
                 },
                 "summary": {

@@ -13,6 +13,7 @@ class AttendanceLog(models.Model):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PRESENT)
     total_work_hours = models.DurationField(null=True, blank=True)
     auto_checked_out = models.BooleanField(default=False)
+    auto_stop_pass = models.CharField(max_length=20, blank=True, default="")
     capped_at_standard_hours = models.BooleanField(default=False)
     forgot_checkout_email_sent = models.BooleanField(default=False)
     last_activity_at = models.DateTimeField(null=True, blank=True)

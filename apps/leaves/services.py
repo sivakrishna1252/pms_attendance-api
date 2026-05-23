@@ -3,6 +3,7 @@ from datetime import timedelta
 from django.utils import timezone
 from rest_framework import serializers
 
+from apps.attendance.calendar import holiday_dates_between as calendar_holiday_dates_between
 from apps.common.email import send_attendance_email
 from apps.common.pms_client import employee_display_name, employee_email, fetch_employee_profile
 
@@ -24,13 +25,14 @@ def iter_dates(from_date, to_date):
 
 
 def holiday_dates_between(from_date, to_date):
-    return set(
+    db_dates = set(
         Holiday.objects.filter(
             is_active=True,
             holiday_date__gte=from_date,
             holiday_date__lte=to_date,
         ).values_list("holiday_date", flat=True)
     )
+    return db_dates | calendar_holiday_dates_between(from_date, to_date)
 
 
 def leave_days_between(from_date, to_date):

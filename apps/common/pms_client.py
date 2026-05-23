@@ -94,7 +94,15 @@ def employee_display_name(profile, employee_id):
     first = (profile.get("first_name") or "").strip()
     last = (profile.get("last_name") or "").strip()
     full_name = f"{first} {last}".strip()
-    return full_name or profile.get("email") or f"Employee {employee_id}"
+    if full_name:
+        return full_name
+    email = (profile.get("email") or "").strip()
+    if email:
+        local = email.split("@")[0].replace(".", " ").replace("_", " ").strip()
+        if local:
+            return local.title()
+        return email
+    return f"Employee {employee_id}"
 
 
 def employee_email(profile):

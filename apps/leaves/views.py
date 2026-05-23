@@ -464,3 +464,117 @@ class RejectLeaveAPIView(APIView):
                 "data": leave_card(leave_request, resolver),
             }
         )
+
+
+class AdminHolidayListCreateAPIView(APIView):
+    permission_classes = [IsAttendanceAdmin]
+
+    @extend_schema(
+        tags=["Admin Holidays"],
+        summary="List company holidays in a date range",
+    )
+    def get(self, request):
+        from django.utils.dateparse import parse_date
+
+        from apps.attendance.calendar import holiday_info_for_date, iter_dates
+
+        start_date = parse_date(request.query_params.get("start_date", ""))
+        end_date = parse_date(request.query_params.get("end_date", ""))
+        holidays = Holiday.objects.filter(is_active=True).order_by("holiday_date")
+        if start_date:
+            holidays = holidays.filter(holiday_date__gte=start_date)
+        if end_date:
+            holidays = holidays.filter(holiday_date__lte=end_date)
+
+        admin_holidays = [holiday_card(item) for item in holidays]
+        recurring = []
+        if start_date and end_date:
+            for day in iter_dates(start_date, end_date):
+                is_holiday, name = holiday_info_for_date(day)
+                if is_holiday and not Holiday.objects.filter(holiday_date=day, is_active=True).exists():
+                    recurring.append(
+                        {
+                            "id": None,
+                            "name": name,
+                            "date": day.isoformat(),
+                            "day": day.strftime("%A"),
+                            "description": "Recurring office holiday",
+                            "source": "recurring",
+                        }
+                    )
+
+        return Response(
+            {
+                "success": True,
+                "message": "Holidays fetched successfully.",
+                "admin_holidays": admin_holidays,
+                "recurring_holidays": recurring,
+            }
+        )
+
+    @extend_schema(
+        tags=["Admin Holidays"],
+        summary="Mark a date as company holiday",
+        request=HolidaySerializer,
+    )
+    def post(self, request):
+        from apps.attendance.calendar import recurring_holiday_label
+
+        serializer = HolidaySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        holiday_date = serializer.validated_data["holiday_date"]
+        recurring = recurring_holiday_label(holiday_date)
+        if recurring:
+            return Response(
+                {
+                    "success": True,
+                    "message": f"{holiday_date.isoformat()} is already a recurring holiday ({recurring}).",
+                    "data": {
+                        "date": holiday_date.isoformat(),
+                        "name": recurring,
+                        "source": "recurring",
+                    },
+                }
+            )
+
+        holiday, created = Holiday.objects.update_or_create(
+            holiday_date=holiday_date,
+            defaults={
+                "name": serializer.validated_data["name"],
+                "description": serializer.validated_data.get("description", ""),
+                "is_active": True,
+            },
+        )
+        action = "marked" if created else "updated"
+        return Response(
+            {
+                "success": True,
+                "message": f"Date {holiday_date.isoformat()} {action} as company holiday.",
+                "data": holiday_card(holiday),
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class AdminHolidayDetailAPIView(APIView):
+    permission_classes = [IsAttendanceAdmin]
+
+    @extend_schema(
+        tags=["Admin Holidays"],
+        summary="Remove an admin-defined company holiday",
+    )
+    def delete(self, request, holiday_id):
+        holiday = Holiday.objects.filter(pk=holiday_id).first()
+        if holiday is None:
+            return Response(
+                {"success": False, "message": "Holiday not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        holiday.is_active = False
+        holiday.save(update_fields=["is_active"])
+        return Response(
+            {
+                "success": True,
+                "message": f"Holiday {holiday.holiday_date.isoformat()} removed.",
+            }
+        )

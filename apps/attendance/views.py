@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from django.db import IntegrityError, transaction
 from django.db.models import Count
 from django.utils import timezone
-from django.utils.dateparse import parse_date
+from django.utils.dateparse import parse_date, parse_datetime
 from drf_spectacular.utils import OpenApiExample, extend_schema
 from rest_framework import status
 from rest_framework.exceptions import AuthenticationFailed
@@ -11,12 +11,17 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.authentication.permissions import IsAttendanceAdmin
-from apps.common.employee_profiles import resolver_from_request
+from apps.common.employee_profiles import resolver_from_request, seed_staff_resolver
+from apps.common.pms_client import staff_users_from_pms
 from apps.leaves.models import LeaveRequest
+
+from .calendar import holiday_info_for_date, is_company_holiday, shift_label_for_date
 
 from .constants import LATE_CHECK_IN_HOUR, LATE_CHECK_IN_MINUTE
 from .models import AttendanceLog
 from .serializers import AttendanceLogSerializer
+from .status_rules import resolve_work_day_status
+from .auto_stop import resolve_auto_stop_phase
 from .services import (
     apply_auto_checkout_if_needed,
     can_check_in_now,
@@ -81,8 +86,6 @@ def resolve_record_is_late(record):
         return True
     check_in_time = record.get("check_in_time")
     if check_in_time:
-        from django.utils.dateparse import parse_datetime
-
         parsed = parse_datetime(check_in_time)
         if parsed:
             if timezone.is_naive(parsed):
@@ -94,13 +97,39 @@ def resolve_record_is_late(record):
 
 def apply_display_status(record):
     status = record.get("status")
-    if status == "WFH":
+    if status == "HOLIDAY":
+        record["display_status"] = "Holiday"
+    elif status == "WFH":
         record["display_status"] = "WFH"
     elif status == "ON_LEAVE":
         record["display_status"] = "Absent"
+    elif status == "ABSENT":
+        record["display_status"] = "Absent"
     elif record.get("has_check_in"):
         record["is_late"] = resolve_record_is_late(record)
-        record["display_status"] = "Late" if record["is_late"] else "Present"
+        analysis = record.get("work_analysis") or {}
+        worked = analysis.get("work_hours")
+        total_work_hours = None
+        if isinstance(worked, (int, float)):
+            total_work_hours = timedelta(hours=worked)
+
+        check_in_dt = None
+        raw_check_in = record.get("check_in_time")
+        if raw_check_in:
+            parsed = parse_datetime(raw_check_in)
+            if parsed:
+                if timezone.is_naive(parsed):
+                    parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+                check_in_dt = parsed
+
+        day = parse_date(record.get("date")) or timezone.localdate()
+        record["display_status"] = resolve_work_day_status(
+            day=day,
+            check_in_time=check_in_dt or True,
+            total_work_hours=total_work_hours,
+            is_late=record["is_late"],
+            auto_checked_out=bool(record.get("auto_checked_out")),
+        )
     else:
         record["display_status"] = record.get("display_status") or "—"
     record["status_label"] = record["display_status"]
@@ -141,7 +170,7 @@ def format_attendance_record(attendance, resolver=None):
             "email": "",
         }
     )
-    return {
+    record = {
         "id": attendance.id,
         "employee_id": attendance.employee_id,
         "employee_name": employee["name"],
@@ -163,18 +192,65 @@ def format_attendance_record(attendance, resolver=None):
         "duration": format_duration(attendance.total_work_hours),
         "location": DEFAULT_OFFICE_LOCATION,
         "auto_checked_out": analysis["auto_checked_out"],
+        "auto_stop_pass": getattr(attendance, "auto_stop_pass", "") or "",
+        "last_activity_at": (
+            timezone.localtime(attendance.last_activity_at).isoformat()
+            if attendance.last_activity_at
+            else None
+        ),
+        "last_activity_display": (
+            format_time(attendance.last_activity_at)
+            if attendance.last_activity_at
+            else "-"
+        ),
+        "has_check_in": bool(attendance.check_in_time),
         "is_late": is_late_check_in(attendance.check_in_time),
         "work_analysis": analysis,
         "raw": AttendanceLogSerializer(attendance).data,
     }
+    record = apply_display_status(record)
+    if attendance.auto_checked_out:
+        stop_pass = getattr(attendance, "auto_stop_pass", "") or "8PM"
+        if record.get("display_status") == "Overtime":
+            record["attendance_type"] = f"Auto Stop ({stop_pass}) · Overtime"
+        else:
+            record["attendance_type"] = f"Auto Stop ({stop_pass})"
+    elif not attendance.check_out_time and resolve_auto_stop_phase():
+        record["attendance_type"] = "Still working"
+    return record
 
 
-def build_today_payload(attendance):
+def build_today_payload(attendance, *, employee_id=None):
     checked_in = attendance is not None
     checked_out = bool(attendance and attendance.check_out_time)
     can_check_in, next_available = can_check_in_now(attendance)
+    today = timezone.localdate()
+    is_holiday, holiday_name = holiday_info_for_date(today)
+    on_leave_ids, _wfh_ids = leave_flags_for_date(today)
+    on_approved_leave = employee_id is not None and int(employee_id) in on_leave_ids
+    access_blocked = is_holiday or on_approved_leave
+    access_blocked_reason = (
+        "holiday"
+        if is_holiday
+        else "approved_leave"
+        if on_approved_leave
+        else None
+    )
+    access_blocked_message = None
+    if is_holiday:
+        access_blocked_message = (
+            f"Today is a company holiday ({holiday_name}). "
+            "Check-in and check-out are not available."
+        )
+    elif on_approved_leave:
+        access_blocked_message = (
+            "You have approved leave today. Check-in and check-out are not available."
+        )
 
-    if checked_out:
+    if access_blocked:
+        action = "wait"
+        can_check_in = False
+    elif checked_out:
         action = "done"
     elif checked_in:
         action = "check_out"
@@ -186,19 +262,25 @@ def build_today_payload(attendance):
     analysis = work_analysis(attendance) if attendance else None
 
     return {
-        "date": timezone.localdate().isoformat(),
+        "date": today.isoformat(),
+        "is_holiday": is_holiday,
+        "on_approved_leave": on_approved_leave,
+        "holiday_name": holiday_name or None,
+        "access_blocked": access_blocked,
+        "access_blocked_reason": access_blocked_reason,
+        "access_blocked_message": access_blocked_message,
         "office": {
             "name": DEFAULT_OFFICE_LOCATION,
-            "shift": DEFAULT_SHIFT_LABEL,
-            "status": "In Office",
-            "is_inside_office": True,
+            "shift": shift_label_for_date(today),
+            "status": "Holiday" if is_holiday else "In Office",
+            "is_inside_office": not is_holiday,
         },
         "state": {
             "checked_in": checked_in,
             "checked_out": checked_out,
             "next_action": action,
-            "can_check_in": can_check_in and not checked_in,
-            "can_check_out": checked_in and not checked_out,
+            "can_check_in": can_check_in and not checked_in and not access_blocked,
+            "can_check_out": checked_in and not checked_out and not access_blocked,
             "next_check_in_at": next_available.isoformat() if next_available else None,
             "next_check_in_at_display": format_time(next_available) if next_available else None,
         },
@@ -216,8 +298,7 @@ def build_today_payload(attendance):
             ] + (
                 [
                     {
-                        "label": "Checked Out"
-                        + (" (Auto)" if attendance.auto_checked_out else ""),
+                        "label": "Auto Stop" if attendance.auto_checked_out else "Checked Out",
                         "time": format_time(attendance.check_out_time),
                         "location": DEFAULT_OFFICE_LOCATION,
                     }
@@ -269,6 +350,46 @@ def leave_flags_for_date(attendance_date):
     return on_leave_ids, wfh_ids
 
 
+def attendance_day_restrictions(employee_id, attendance_date=None):
+    """
+    Returns (allowed, message, reason).
+    reason: None | 'holiday' | 'approved_leave'
+    Blocks check-in and check-out on company holidays and approved leave (non-WFH).
+    """
+    attendance_date = attendance_date or timezone.localdate()
+    is_holiday, holiday_name = holiday_info_for_date(attendance_date)
+    if is_holiday:
+        return (
+            False,
+            f"Today is a company holiday ({holiday_name}). Check-in and check-out are not allowed.",
+            "holiday",
+        )
+
+    on_leave_ids, _wfh_ids = leave_flags_for_date(attendance_date)
+    if int(employee_id) in on_leave_ids:
+        return (
+            False,
+            "You have approved leave today. Check-in and check-out are not allowed.",
+            "approved_leave",
+        )
+
+    return True, None, None
+
+
+def attendance_access_denied_response(employee_id, *, status_code=status.HTTP_400_BAD_REQUEST):
+    allowed, message, _reason = attendance_day_restrictions(employee_id)
+    if allowed:
+        return None
+    return Response(
+        {
+            "success": False,
+            "message": message,
+            "data": build_today_payload(None, employee_id=employee_id),
+        },
+        status=status_code,
+    )
+
+
 def format_leave_only_record(employee_id, attendance_date, resolver, *, is_wfh=False):
     employee = (
         resolver.employee_block(employee_id)
@@ -284,6 +405,7 @@ def format_leave_only_record(employee_id, attendance_date, resolver, *, is_wfh=F
     )
     status = "WFH" if is_wfh else "ON_LEAVE"
     status_label = "WFH" if is_wfh else "Absent"
+    display_status = status_label
     return {
         "id": None,
         "employee_id": employee_id,
@@ -296,6 +418,7 @@ def format_leave_only_record(employee_id, attendance_date, resolver, *, is_wfh=F
         "day": attendance_date.strftime("%A"),
         "status": status,
         "status_label": status_label,
+        "display_status": display_status,
         "check_in": "-",
         "check_out": "-",
         "duration": "-",
@@ -304,13 +427,53 @@ def format_leave_only_record(employee_id, attendance_date, resolver, *, is_wfh=F
         "has_check_in": False,
         "attendance_type": "WFH" if is_wfh else "Leave",
         "is_late": False,
-        "display_status": status_label,
         "work_analysis": work_analysis(None),
         "raw": None,
     }
 
 
-def format_no_checkin_record(employee_id, attendance_date, resolver):
+def format_no_checkin_record(employee_id, attendance_date, resolver, *, as_absent=False):
+    employee = (
+        resolver.employee_block(employee_id)
+        if resolver
+        else {
+            "id": employee_id,
+            "name": f"Employee {employee_id}",
+            "department": "—",
+            "role": "—",
+            "initials": f"E{employee_id}",
+            "email": "",
+        }
+    )
+    status = "ABSENT" if as_absent else "NOT_CHECKED_IN"
+    display_status = "Absent" if as_absent else "—"
+    return {
+        "id": None,
+        "employee_id": employee_id,
+        "employee_name": employee["name"],
+        "employee_department": employee["department"],
+        "employee_role": employee.get("role", "—"),
+        "employee_initials": employee["initials"],
+        "employee": employee,
+        "date": attendance_date.isoformat(),
+        "day": attendance_date.strftime("%A"),
+        "status": status,
+        "status_label": display_status,
+        "display_status": display_status,
+        "check_in": "-",
+        "check_out": "-",
+        "duration": "-",
+        "location": "—",
+        "auto_checked_out": False,
+        "has_check_in": False,
+        "attendance_type": "Absent" if as_absent else "—",
+        "is_late": False,
+        "work_analysis": work_analysis(None),
+        "raw": None,
+    }
+
+
+def format_holiday_record(employee_id, attendance_date, resolver, *, holiday_name):
     employee = (
         resolver.employee_block(employee_id)
         if resolver
@@ -333,37 +496,43 @@ def format_no_checkin_record(employee_id, attendance_date, resolver):
         "employee": employee,
         "date": attendance_date.isoformat(),
         "day": attendance_date.strftime("%A"),
-        "status": "NOT_CHECKED_IN",
-        "status_label": "—",
-        "display_status": "—",
+        "status": "HOLIDAY",
+        "status_label": "Holiday",
+        "display_status": "Holiday",
+        "holiday_name": holiday_name,
         "check_in": "-",
         "check_out": "-",
         "duration": "-",
         "location": "—",
         "auto_checked_out": False,
         "has_check_in": False,
-        "attendance_type": "—",
+        "attendance_type": "Holiday",
         "is_late": False,
         "work_analysis": work_analysis(None),
         "raw": None,
     }
 
 
-def annotate_attendance_day_context(record, *, on_leave_ids, wfh_ids):
+def annotate_attendance_day_context(record, *, on_leave_ids, wfh_ids, is_holiday=False, holiday_name=""):
     employee_id = record["employee_id"]
     has_check_in = record.get("check_in") not in (None, "-", "")
     record["has_check_in"] = has_check_in
 
-    if employee_id in wfh_ids:
+    if is_holiday and not has_check_in:
+        record["status"] = "HOLIDAY"
+        record["status_label"] = "Holiday"
+        record["attendance_type"] = "Holiday"
+        record["holiday_name"] = holiday_name
+    elif employee_id in wfh_ids:
         record["status"] = "WFH"
         record["status_label"] = "WFH"
         record["attendance_type"] = "WFH"
     elif employee_id in on_leave_ids and not has_check_in:
         record["status"] = "ON_LEAVE"
-        record["status_label"] = "Absent"
+        record["status_label"] = "Leave"
         record["attendance_type"] = "Leave"
     elif record.get("auto_checked_out"):
-        record["attendance_type"] = "Auto checkout"
+        record["attendance_type"] = "Auto Stop"
     else:
         record["attendance_type"] = record.get("attendance_type") or "Office"
     return apply_display_status(record)
@@ -391,7 +560,12 @@ def average_work_hours_summary(records):
 def apply_check_in_filter(records, check_in_filter):
     normalized = (check_in_filter or "all").lower()
     if normalized in {"", "all"}:
-        return records
+        return [
+            item
+            for item in records
+            if item.get("has_check_in")
+            or item.get("status") in ("ON_LEAVE", "WFH", "HOLIDAY")
+        ]
     if normalized == "checked_in":
         return [item for item in records if item.get("has_check_in")]
     if normalized in {"without_check_in", "no_check_in", "not_checked_in"}:
@@ -399,7 +573,7 @@ def apply_check_in_filter(records, check_in_filter):
             item
             for item in records
             if not item.get("has_check_in")
-            and item.get("status") not in ("ON_LEAVE", "WFH")
+            and item.get("status") not in ("ON_LEAVE", "WFH", "HOLIDAY")
         ]
     return records
 
@@ -410,6 +584,7 @@ def apply_status_filter(records, status_filter):
         "late": "Late",
         "present": "Present",
         "absent": "Absent",
+        "leave": "Leave",
         "wfh": "WFH",
     }
     target = targets.get(normalized)
@@ -429,6 +604,23 @@ def parse_staff_ids_param(raw):
     return ids
 
 
+def _resolve_staff_employee_ids(resolver, *, auth_token=None, staff_ids=None, employee_id=None):
+    if employee_id:
+        return [int(employee_id)]
+    if staff_ids:
+        return list(staff_ids)
+
+    if resolver:
+        seed_staff_resolver(resolver, token=auth_token)
+        if resolver._cache:
+            return sorted(resolver._cache.keys())
+
+    users = staff_users_from_pms()
+    if users:
+        return sorted(int(user["id"]) for user in users if user.get("id") is not None)
+    return []
+
+
 def build_admin_day_payload(
     attendance_date,
     *,
@@ -439,6 +631,7 @@ def build_admin_day_payload(
     auth_token=None,
     staff_ids=None,
 ):
+    is_holiday, holiday_name = holiday_info_for_date(attendance_date)
     today_logs = AttendanceLog.objects.filter(attendance_date=attendance_date).order_by("-check_in_time")
     if employee_id:
         today_logs = today_logs.filter(employee_id=employee_id)
@@ -447,31 +640,58 @@ def build_admin_day_payload(
     records_by_employee = {}
 
     for attendance in today_logs:
-        record = format_attendance_record(attendance, None)
+        record = format_attendance_record(attendance, resolver)
         annotate_attendance_day_context(
             record,
             on_leave_ids=on_leave_ids,
             wfh_ids=wfh_ids,
+            is_holiday=is_holiday,
+            holiday_name=holiday_name,
         )
         records_by_employee[attendance.employee_id] = record
 
-    if not employee_id:
-        for emp_id in on_leave_ids:
-            if emp_id not in records_by_employee:
-                records_by_employee[emp_id] = format_leave_only_record(
-                    emp_id,
-                    attendance_date,
-                    None,
-                    is_wfh=False,
-                )
-        for emp_id in wfh_ids:
-            if emp_id not in records_by_employee:
-                records_by_employee[emp_id] = format_leave_only_record(
-                    emp_id,
-                    attendance_date,
-                    None,
-                    is_wfh=True,
-                )
+    target_employee_ids = _resolve_staff_employee_ids(
+        resolver,
+        auth_token=auth_token,
+        staff_ids=staff_ids,
+        employee_id=employee_id,
+    )
+    if not target_employee_ids:
+        target_employee_ids = sorted(
+            set(records_by_employee.keys()) | on_leave_ids | wfh_ids
+        )
+
+    for emp_id in target_employee_ids:
+        if emp_id in records_by_employee:
+            continue
+        if is_holiday:
+            records_by_employee[emp_id] = format_holiday_record(
+                emp_id,
+                attendance_date,
+                resolver,
+                holiday_name=holiday_name,
+            )
+        elif emp_id in on_leave_ids:
+            records_by_employee[emp_id] = format_leave_only_record(
+                emp_id,
+                attendance_date,
+                resolver,
+                is_wfh=False,
+            )
+        elif emp_id in wfh_ids:
+            records_by_employee[emp_id] = format_leave_only_record(
+                emp_id,
+                attendance_date,
+                resolver,
+                is_wfh=True,
+            )
+        else:
+            records_by_employee[emp_id] = format_no_checkin_record(
+                emp_id,
+                attendance_date,
+                resolver,
+                as_absent=False,
+            )
 
     records = sorted(
         records_by_employee.values(),
@@ -494,6 +714,12 @@ def build_admin_day_payload(
     extra_work_count = sum(
         1 for item in records_by_employee.values() if item["work_analysis"]["variance"] == "extra_work"
     )
+    overtime_count = sum(
+        1
+        for item in records_by_employee.values()
+        if item.get("display_status") == "Overtime"
+        or item["work_analysis"].get("is_overtime")
+    )
     less_work_count = sum(
         1 for item in records_by_employee.values() if item["work_analysis"]["variance"] == "less_work"
     )
@@ -503,9 +729,19 @@ def build_admin_day_payload(
         if item.get("display_status") == "Late" or resolve_record_is_late(item)
     )
 
-    absent_count = len(on_leave_ids)
+    absent_count = sum(
+        1 for item in records_by_employee.values() if item.get("display_status") == "Absent"
+    )
+    holiday_count = sum(
+        1 for item in records_by_employee.values() if item.get("display_status") == "Holiday"
+    )
     if employee_id:
-        absent_count = 1 if int(employee_id) in on_leave_ids else 0
+        absent_count = 1 if int(employee_id) in on_leave_ids else (
+            1 if records_by_employee.get(int(employee_id), {}).get("display_status") == "Absent" else 0
+        )
+        holiday_count = (
+            1 if records_by_employee.get(int(employee_id), {}).get("display_status") == "Holiday" else 0
+        )
     wfh_count = len(wfh_ids)
     if employee_id:
         wfh_count = 1 if int(employee_id) in wfh_ids else 0
@@ -514,10 +750,16 @@ def build_admin_day_payload(
 
     return {
         "records": records,
+        "day_context": {
+            "is_holiday": is_holiday,
+            "holiday_name": holiday_name,
+            "can_mark_holiday": not is_holiday,
+        },
         "summary": {
             "present": checked_in_count,
             "absent": absent_count,
-            "leave": absent_count,
+            "leave": len(on_leave_ids) if not employee_id else (1 if int(employee_id) in on_leave_ids else 0),
+            "holiday": holiday_count,
             "wfh": wfh_count,
             "on_leave_employee_ids": sorted(on_leave_ids),
             "wfh_employee_ids": sorted(wfh_ids),
@@ -529,6 +771,7 @@ def build_admin_day_payload(
             "checked_out": checked_out_count,
             "still_working": still_working_count,
             "extra_work_days": extra_work_count,
+            "overtime_days": overtime_count,
             "less_work_days": less_work_count,
             "late_check_ins": late_count,
             **avg_hours,
@@ -538,6 +781,7 @@ def build_admin_day_payload(
             "checked_out_count": checked_out_count,
             "still_working_count": still_working_count,
             "extra_work_count": extra_work_count,
+            "overtime_count": overtime_count,
             "less_work_count": less_work_count,
             "late_check_ins": late_count,
             "records": records,
@@ -572,6 +816,10 @@ class CheckInAPIView(APIView):
         today = timezone.localdate()
         close_stale_open_sessions(employee_id)
 
+        denied = attendance_access_denied_response(employee_id)
+        if denied:
+            return denied
+
         existing = AttendanceLog.objects.filter(employee_id=employee_id, attendance_date=today).first()
         if existing:
             existing = apply_auto_checkout_if_needed(existing)
@@ -584,7 +832,7 @@ class CheckInAPIView(APIView):
                             "You already completed check-in and check-out today. "
                             f"Next check-in opens at {format_time(available_at)}."
                         ),
-                        "data": build_today_payload(existing),
+                        "data": build_today_payload(existing, employee_id=employee_id),
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
@@ -592,7 +840,7 @@ class CheckInAPIView(APIView):
                 {
                     "success": False,
                     "message": "Already checked in today. Please check out first.",
-                    "data": build_today_payload(existing),
+                    "data": build_today_payload(existing, employee_id=employee_id),
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -609,7 +857,7 @@ class CheckInAPIView(APIView):
                     {
                         "success": False,
                         "message": f"Check-in opens at {format_time(available_at)} (next working day 9:00 AM).",
-                        "data": build_today_payload(None),
+                        "data": build_today_payload(None, employee_id=employee_id),
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
@@ -629,7 +877,7 @@ class CheckInAPIView(APIView):
                 {
                     "success": False,
                     "message": "Already checked in today.",
-                    "data": build_today_payload(attendance),
+                    "data": build_today_payload(attendance, employee_id=employee_id),
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -638,7 +886,7 @@ class CheckInAPIView(APIView):
             {
                 "success": True,
                 "message": "Checked in successfully.",
-                "data": build_today_payload(attendance),
+                "data": build_today_payload(attendance, employee_id=employee_id),
             },
             status=status.HTTP_201_CREATED,
         )
@@ -661,6 +909,10 @@ class CheckOutAPIView(APIView):
     )
     def post(self, request):
         employee_id = employee_id_from_request(request)
+        denied = attendance_access_denied_response(employee_id)
+        if denied:
+            return denied
+
         attendance = get_today_attendance(employee_id)
 
         if attendance is None:
@@ -674,7 +926,7 @@ class CheckOutAPIView(APIView):
                 {
                     "success": False,
                     "message": "Already checked out today. Next check-in is available tomorrow from 9:00 AM.",
-                    "data": build_today_payload(attendance),
+                    "data": build_today_payload(attendance, employee_id=employee_id),
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -688,7 +940,7 @@ class CheckOutAPIView(APIView):
             {
                 "success": True,
                 "message": "Checked out successfully.",
-                "data": build_today_payload(attendance),
+                "data": build_today_payload(attendance, employee_id=employee_id),
             }
         )
 
@@ -701,20 +953,24 @@ class AttendanceActivityAPIView(APIView):
     )
     def post(self, request):
         employee_id = employee_id_from_request(request)
+        denied = attendance_access_denied_response(employee_id)
+        if denied:
+            return denied
+
         attendance = record_activity(employee_id)
         if attendance is None:
             return Response(
                 {
                     "success": True,
                     "message": "No active check-in session for today.",
-                    "data": build_today_payload(None),
+                    "data": build_today_payload(None, employee_id=employee_id),
                 }
             )
         return Response(
             {
                 "success": True,
                 "message": "Activity recorded.",
-                "data": build_today_payload(attendance),
+                "data": build_today_payload(attendance, employee_id=employee_id),
             }
         )
 
@@ -763,14 +1019,14 @@ class TodayAttendanceAPIView(APIView):
                 {
                     "success": True,
                     "message": "No attendance record for today.",
-                    "data": build_today_payload(None),
+                    "data": build_today_payload(None, employee_id=employee_id),
                 }
             )
         return Response(
             {
                 "success": True,
                 "message": "Today's attendance fetched successfully.",
-                "data": build_today_payload(attendance),
+                "data": build_today_payload(attendance, employee_id=employee_id),
             }
         )
 
@@ -816,6 +1072,7 @@ class AdminAttendanceHistoryAPIView(APIView):
                         "check_in_filter": check_in_filter,
                         "status_filter": status_filter,
                     },
+                    "day_context": day_payload.get("day_context"),
                     "summary": day_payload["summary"],
                     "records": day_payload["records"],
                 }
@@ -899,6 +1156,7 @@ class AdminDashboardAPIView(APIView):
                 "success": True,
                 "message": "Admin dashboard fetched successfully.",
                 "date": dashboard_date.isoformat(),
+                "day_context": day_payload.get("day_context"),
                 "attendance_today": day_payload["attendance_today"],
                 "summary": day_payload["summary"],
                 "leaves": {
