@@ -108,7 +108,7 @@ def months_ago(reference: date, months: int) -> date:
 REPORT_RETENTION_MONTHS = 6
 
 
-def resolve_report_date_range(start_date, end_date, *, today=None):
+def resolve_report_date_range(start_date, end_date, *, today=None, allow_future_end=False):
     from django.utils import timezone
 
     today = today or timezone.localdate()
@@ -130,7 +130,21 @@ def resolve_report_date_range(start_date, end_date, *, today=None):
         resolved_start = earliest_allowed
 
     if resolved_end > today:
-        resolved_end = today
+        if allow_future_end:
+            max_future = today + timedelta(days=365)
+            if resolved_end > max_future:
+                warnings.append(
+                    f"End date adjusted to {max_future.isoformat()} "
+                    "(leave reports can include up to one year ahead)."
+                )
+                resolved_end = max_future
+        else:
+            if end_date and end_date > today:
+                warnings.append(
+                    f"End date adjusted to {today.isoformat()} "
+                    "because attendance data is only available through today."
+                )
+            resolved_end = today
 
     if resolved_start > resolved_end:
         resolved_start = default_start

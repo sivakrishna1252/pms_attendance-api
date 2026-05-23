@@ -172,11 +172,16 @@ class AttendanceReportsAPIView(APIView):
     def get(self, request):
         raw_start = parse_date(request.query_params.get("start_date", ""))
         raw_end = parse_date(request.query_params.get("end_date", ""))
-        start_date, end_date, warnings = resolve_report_date_range(raw_start, raw_end)
+        report_type = request.query_params.get("report_type", REPORT_TYPE_ATTENDANCE)
+        allow_future_end = report_type in {REPORT_TYPE_LEAVE, REPORT_TYPE_COMBINED}
+        start_date, end_date, warnings = resolve_report_date_range(
+            raw_start,
+            raw_end,
+            allow_future_end=allow_future_end,
+        )
 
         employee_id = request.query_params.get("employee_id")
         staff_ids = parse_staff_ids_param(request.query_params.get("staff_ids", ""))
-        report_type = request.query_params.get("report_type", REPORT_TYPE_ATTENDANCE)
         export_format = request.query_params.get("export", "").lower()
         needs_leave_stats = report_type in {REPORT_TYPE_LEAVE, REPORT_TYPE_COMBINED}
 
