@@ -151,9 +151,28 @@ def close_stale_open_sessions(employee_id):
 def get_today_attendance(employee_id, *, apply_auto=True):
     today = timezone.localdate()
     attendance = AttendanceLog.objects.filter(employee_id=employee_id, attendance_date=today).first()
+    if attendance and not attendance.check_in_time:
+        attendance.delete()
+        return None
     if apply_auto and attendance:
         attendance = apply_auto_checkout_if_needed(attendance)
     return attendance
+
+
+def next_check_in_gate(employee_id, today):
+    """Block check-in until next working day 9:00 AM after yesterday's check-out."""
+    if employee_id is None:
+        return None
+    yesterday = today - timedelta(days=1)
+    yesterday_log = AttendanceLog.objects.filter(
+        employee_id=employee_id,
+        attendance_date=yesterday,
+    ).first()
+    if yesterday_log and yesterday_log.check_out_time:
+        available_at = next_check_in_available_at(yesterday)
+        if timezone.now() < available_at:
+            return available_at
+    return None
 
 
 def format_attendance_record(attendance, resolver=None):
@@ -221,10 +240,20 @@ def format_attendance_record(attendance, resolver=None):
 
 
 def build_today_payload(attendance, *, employee_id=None):
-    checked_in = attendance is not None
-    checked_out = bool(attendance and attendance.check_out_time)
+    has_check_in = bool(attendance and attendance.check_in_time)
+    checked_in = bool(
+        attendance and attendance.check_in_time and not attendance.check_out_time
+    )
+    checked_out = bool(
+        attendance and attendance.check_in_time and attendance.check_out_time
+    )
     can_check_in, next_available = can_check_in_now(attendance)
     today = timezone.localdate()
+    check_in_gate = next_check_in_gate(employee_id, today)
+    if check_in_gate and not has_check_in:
+        can_check_in = False
+        if next_available is None or check_in_gate > next_available:
+            next_available = check_in_gate
     is_holiday, holiday_name = holiday_info_for_date(today)
     on_leave_ids, _wfh_ids = leave_flags_for_date(today)
     on_approved_leave = employee_id is not None and int(employee_id) in on_leave_ids
@@ -247,9 +276,11 @@ def build_today_payload(attendance, *, employee_id=None):
             "You have approved leave today. Check-in and check-out are not available."
         )
 
+    wait_message = None
     if access_blocked:
         action = "wait"
         can_check_in = False
+        wait_message = access_blocked_message
     elif checked_out:
         action = "done"
     elif checked_in:
@@ -258,6 +289,11 @@ def build_today_payload(attendance, *, employee_id=None):
         action = "check_in"
     else:
         action = "wait"
+        wait_message = (
+            f"Check-in opens at {format_time(next_available)}."
+            if next_available
+            else "Check-in is not available right now."
+        )
 
     analysis = work_analysis(attendance) if attendance else None
 
@@ -269,6 +305,7 @@ def build_today_payload(attendance, *, employee_id=None):
         "access_blocked": access_blocked,
         "access_blocked_reason": access_blocked_reason,
         "access_blocked_message": access_blocked_message,
+        "wait_message": wait_message,
         "office": {
             "name": DEFAULT_OFFICE_LOCATION,
             "shift": shift_label_for_date(today),
@@ -285,29 +322,32 @@ def build_today_payload(attendance, *, employee_id=None):
             "next_check_in_at_display": format_time(next_available) if next_available else None,
         },
         "today_log": {
-            "check_in": format_time(attendance.check_in_time) if attendance else None,
-            "check_out": format_time(attendance.check_out_time) if attendance else None,
-            "duration": format_duration(attendance.total_work_hours) if attendance else None,
+            "check_in": format_time(attendance.check_in_time) if has_check_in else None,
+            "check_out": format_time(attendance.check_out_time) if checked_out else None,
+            "duration": format_duration(attendance.total_work_hours) if checked_out else None,
             "work_analysis": analysis,
-            "timeline": [
-                {
-                    "label": "Checked In",
-                    "time": format_time(attendance.check_in_time),
-                    "location": DEFAULT_OFFICE_LOCATION,
-                }
-            ] + (
+            "timeline": (
                 [
                     {
-                        "label": "Auto Stop" if attendance.auto_checked_out else "Checked Out",
-                        "time": format_time(attendance.check_out_time),
+                        "label": "Checked In",
+                        "time": format_time(attendance.check_in_time),
                         "location": DEFAULT_OFFICE_LOCATION,
                     }
                 ]
-                if checked_out
-                else [{"label": "Awaiting Check Out", "time": None, "location": None}]
-            )
-            if attendance
-            else [],
+                + (
+                    [
+                        {
+                            "label": "Auto Stop" if attendance.auto_checked_out else "Checked Out",
+                            "time": format_time(attendance.check_out_time),
+                            "location": DEFAULT_OFFICE_LOCATION,
+                        }
+                    ]
+                    if checked_out
+                    else [{"label": "Awaiting Check Out", "time": None, "location": None}]
+                )
+                if has_check_in
+                else []
+            ),
         },
         "attendance": AttendanceLogSerializer(attendance).data if attendance else None,
     }
@@ -340,9 +380,22 @@ def approved_leaves_on_date(attendance_date):
 
 
 def leave_flags_for_date(attendance_date):
+    from apps.leaves.services import is_leave_deductible_day
+
     on_leave_ids = set()
     wfh_ids = set()
-    for leave in approved_leaves_on_date(attendance_date).only("employee_id", "leave_type"):
+    # Include recent leaves so bridge working Saturdays after to_date are picked up.
+    lookback = attendance_date - timedelta(days=6)
+    leaves = LeaveRequest.objects.filter(
+        status=LeaveRequest.Status.APPROVED,
+        from_date__lte=attendance_date,
+        to_date__gte=lookback,
+    ).only("employee_id", "leave_type", "from_date", "to_date")
+    for leave in leaves:
+        if not is_leave_deductible_day(
+            attendance_date, leave.from_date, leave.to_date
+        ):
+            continue
         if leave.leave_type == LeaveRequest.LeaveType.WFH:
             wfh_ids.add(leave.employee_id)
         else:
@@ -518,19 +571,19 @@ def annotate_attendance_day_context(record, *, on_leave_ids, wfh_ids, is_holiday
     has_check_in = record.get("check_in") not in (None, "-", "")
     record["has_check_in"] = has_check_in
 
-    if is_holiday and not has_check_in:
-        record["status"] = "HOLIDAY"
-        record["status_label"] = "Holiday"
-        record["attendance_type"] = "Holiday"
-        record["holiday_name"] = holiday_name
+    if employee_id in on_leave_ids and not has_check_in:
+        record["status"] = "ON_LEAVE"
+        record["status_label"] = "Leave"
+        record["attendance_type"] = "Leave"
     elif employee_id in wfh_ids:
         record["status"] = "WFH"
         record["status_label"] = "WFH"
         record["attendance_type"] = "WFH"
-    elif employee_id in on_leave_ids and not has_check_in:
-        record["status"] = "ON_LEAVE"
-        record["status_label"] = "Leave"
-        record["attendance_type"] = "Leave"
+    elif is_holiday and not has_check_in:
+        record["status"] = "HOLIDAY"
+        record["status_label"] = "Holiday"
+        record["attendance_type"] = "Holiday"
+        record["holiday_name"] = holiday_name
     elif record.get("auto_checked_out"):
         record["attendance_type"] = "Auto Stop"
     else:
@@ -631,6 +684,10 @@ def build_admin_day_payload(
     auth_token=None,
     staff_ids=None,
 ):
+    # One bulk staff lookup per request — avoids per-employee PMS HTTP calls (10s each).
+    if resolver:
+        seed_staff_resolver(resolver, token=auth_token)
+
     is_holiday, holiday_name = holiday_info_for_date(attendance_date)
     today_logs = AttendanceLog.objects.filter(attendance_date=attendance_date).order_by("-check_in_time")
     if employee_id:
@@ -664,14 +721,7 @@ def build_admin_day_payload(
     for emp_id in target_employee_ids:
         if emp_id in records_by_employee:
             continue
-        if is_holiday:
-            records_by_employee[emp_id] = format_holiday_record(
-                emp_id,
-                attendance_date,
-                resolver,
-                holiday_name=holiday_name,
-            )
-        elif emp_id in on_leave_ids:
+        if emp_id in on_leave_ids:
             records_by_employee[emp_id] = format_leave_only_record(
                 emp_id,
                 attendance_date,
@@ -684,6 +734,13 @@ def build_admin_day_payload(
                 attendance_date,
                 resolver,
                 is_wfh=True,
+            )
+        elif is_holiday:
+            records_by_employee[emp_id] = format_holiday_record(
+                emp_id,
+                attendance_date,
+                resolver,
+                holiday_name=holiday_name,
             )
         else:
             records_by_employee[emp_id] = format_no_checkin_record(
@@ -821,6 +878,9 @@ class CheckInAPIView(APIView):
             return denied
 
         existing = AttendanceLog.objects.filter(employee_id=employee_id, attendance_date=today).first()
+        if existing and not existing.check_in_time:
+            existing.delete()
+            existing = None
         if existing:
             existing = apply_auto_checkout_if_needed(existing)
             allowed, available_at = can_check_in_now(existing)
@@ -1077,6 +1137,9 @@ class AdminAttendanceHistoryAPIView(APIView):
                     "records": day_payload["records"],
                 }
             )
+
+        if resolver:
+            seed_staff_resolver(resolver, token=auth_token)
 
         attendance = AttendanceLog.objects.all()
         if employee_id:

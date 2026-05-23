@@ -16,7 +16,9 @@ from apps.common.employee_profiles import resolver_from_request, seed_staff_reso
 from apps.leaves.models import LeaveRequest
 from apps.reports.generators import (
     build_attendance_report_rows,
+    build_attendance_summary_row,
     build_leave_report_rows,
+    compute_attendance_status_totals,
 )
 
 REPORT_TYPE_ATTENDANCE = "attendance_summary"
@@ -229,6 +231,8 @@ class AttendanceReportsAPIView(APIView):
                         leave_days_by_status.get(leave.status, 0) + _leave_days(leave)
                     )
 
+        attendance_status_totals = None
+
         if report_type == REPORT_TYPE_LEAVE:
             preview_columns = [
                 "employee_name",
@@ -292,10 +296,17 @@ class AttendanceReportsAPIView(APIView):
                 staff_ids=staff_ids,
                 attendance_queryset=attendance,
             )
+            attendance_status_totals = compute_attendance_status_totals(
+                full_rows,
+                start_date=start_date,
+                end_date=end_date,
+            )
             report_title = "Attendance Summary"
 
         export_rows = full_rows[:EXPORT_ROW_LIMIT]
         preview_rows = full_rows[:PREVIEW_ROW_LIMIT]
+        if report_type == REPORT_TYPE_ATTENDANCE and attendance_status_totals is not None:
+            export_rows = export_rows + [build_attendance_summary_row(attendance_status_totals)]
 
         export_column_labels = {
             "employee_name": "Employee Name",
@@ -351,6 +362,7 @@ class AttendanceReportsAPIView(APIView):
                     "columns": preview_columns,
                     "rows": preview_rows,
                     "row_count": len(full_rows),
+                    "summary_totals": attendance_status_totals,
                     "export_formats": [EXPORT_FORMAT_PDF, EXPORT_FORMAT_EXCEL, EXPORT_FORMAT_CSV],
                 },
                 "summary": {

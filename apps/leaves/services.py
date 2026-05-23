@@ -1,9 +1,10 @@
 from datetime import timedelta
+from functools import lru_cache
 
 from django.utils import timezone
 from rest_framework import serializers
 
-from apps.attendance.calendar import holiday_dates_between as calendar_holiday_dates_between
+from apps.attendance.calendar import is_working_day, is_working_saturday
 from apps.common.email import send_attendance_email
 from apps.common.pms_client import employee_display_name, employee_email, fetch_employee_profile
 
@@ -24,19 +25,51 @@ def iter_dates(from_date, to_date):
         current += timedelta(days=1)
 
 
-def holiday_dates_between(from_date, to_date):
-    db_dates = set(
-        Holiday.objects.filter(
-            is_active=True,
-            holiday_date__gte=from_date,
-            holiday_date__lte=to_date,
-        ).values_list("holiday_date", flat=True)
-    )
-    return db_dates | calendar_holiday_dates_between(from_date, to_date)
+def _bridge_working_saturday_after(last_leave_working_day):
+    """2nd/4th/5th Saturday immediately after the last leave working day."""
+    next_day = last_leave_working_day + timedelta(days=1)
+    if is_working_saturday(next_day):
+        return next_day
+    return None
+
+
+@lru_cache(maxsize=256)
+def leave_deductible_days(from_date, to_date):
+    """
+    Days that count against leave balance:
+    - all working days in the selected range
+    - non-working days sandwiched between two leave working days in the range
+    - a working Saturday (2nd/4th/5th) right after the last leave day when
+      the employee returns on the following Monday (Fri leave + Mon office = 2 days)
+    """
+    dates = list(iter_dates(from_date, to_date))
+    working = {day for day in dates if is_working_day(day)}
+    if not working:
+        return frozenset()
+
+    deductible = set(working)
+    for index, day in enumerate(dates):
+        if is_working_day(day):
+            continue
+        has_prev_working = any(is_working_day(dates[i]) for i in range(index - 1, -1, -1))
+        has_next_working = any(is_working_day(dates[i]) for i in range(index + 1, len(dates)))
+        if has_prev_working and has_next_working:
+            deductible.add(day)
+
+    bridge = _bridge_working_saturday_after(max(working))
+    if bridge is not None:
+        deductible.add(bridge)
+
+    return frozenset(deductible)
+
+
+def is_leave_deductible_day(day, from_date, to_date):
+    return day in leave_deductible_days(from_date, to_date)
 
 
 def leave_days_between(from_date, to_date):
-    return max((to_date - from_date).days + 1, 1)
+    """Count leave days with sandwich policy applied."""
+    return len(leave_deductible_days(from_date, to_date))
 
 
 def validate_leave_balance(*, employee_id, leave_type, from_date, to_date):
@@ -80,19 +113,22 @@ def validate_leave_application(
             {"to_date": ["To date cannot be before from date."]}
         )
 
+    working_days = leave_days_between(from_date, to_date)
+    if working_days == 0:
+        raise serializers.ValidationError(
+            {
+                "from_date": [
+                    "Selected dates contain no working days. Choose a range that includes at least one office working day."
+                ]
+            }
+        )
+
     validate_leave_balance(
         employee_id=employee_id,
         leave_type=leave_type,
         from_date=from_date,
         to_date=to_date,
     )
-
-    holidays = holiday_dates_between(from_date, to_date)
-    if holidays:
-        labels = ", ".join(sorted(day.isoformat() for day in holidays))
-        raise serializers.ValidationError(
-            {"from_date": [f"Selected dates include company holiday(s): {labels}."]}
-        )
 
     overlap_query = LeaveRequest.objects.filter(
         employee_id=employee_id,

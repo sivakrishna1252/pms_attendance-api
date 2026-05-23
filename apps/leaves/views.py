@@ -14,6 +14,7 @@ from .serializers import HolidaySerializer, LeaveApprovalSerializer, LeaveBalanc
 from .notifications import notify_admins_leave_submitted, notify_employee_leave_decision
 from .services import (
     deduct_leave_balance,
+    leave_days_between,
     send_leave_status_email,
     upcoming_holidays,
 )
@@ -27,7 +28,7 @@ LEAVE_TOTALS = {
 
 
 def leave_days(leave_request):
-    return max((leave_request.to_date - leave_request.from_date).days + 1, 1)
+    return leave_days_between(leave_request.from_date, leave_request.to_date)
 
 
 def leave_type_label(value):

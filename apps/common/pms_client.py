@@ -15,7 +15,7 @@ from apps.common.service_auth import service_authorization_header
 logger = logging.getLogger(__name__)
 
 
-def _pms_get_json(path, *, timeout=10):
+def _pms_get_json(path, *, timeout=3):
     base_url = getattr(settings, "PMS_API_BASE_URL", "") or ""
     authorization = service_authorization_header()
     if not base_url or not authorization:
@@ -78,13 +78,13 @@ def _pms_post_json(path, payload, *, timeout=10):
 
 
 def fetch_employee_profile(employee_id):
-    """Load PMS user profile via internal service API, with PMS DB fallback."""
-    body = _pms_get_json(f"internal/users/{employee_id}/")
-    if isinstance(body, dict) and body.get("success"):
-        return body.get("data") or {}
+    """Load PMS user profile via PMS DB (fast) or internal service API."""
     profile = user_profile_from_db(employee_id)
     if profile:
         return profile
+    body = _pms_get_json(f"internal/users/{employee_id}/")
+    if isinstance(body, dict) and body.get("success"):
+        return body.get("data") or {}
     return {}
 
 
@@ -149,11 +149,14 @@ def create_pms_notifications(notifications):
 
 
 def staff_users_from_pms():
-    """Active PMS Employee/BA users (HTTP internal API, then PMS DB fallback)."""
+    """Active PMS Employee/BA users (PMS DB first, then HTTP internal API)."""
+    db_users = staff_users_from_db()
+    if db_users:
+        return db_users
     body = _pms_get_json("internal/staff-users/")
     if isinstance(body, dict) and body.get("success"):
         data = body.get("data") or {}
         results = data.get("results") if isinstance(data, dict) else []
         if results:
             return results
-    return staff_users_from_db()
+    return []

@@ -31,13 +31,14 @@ def next_check_in_available_at(attendance_date):
 
 
 def can_check_in_now(attendance):
-    if attendance is None:
+    if attendance is None or not attendance.check_in_time:
         return True, None
     if attendance.check_out_time is not None:
         available_at = next_check_in_available_at(attendance.attendance_date)
         if timezone.now() < available_at:
             return False, available_at
-    return False, next_check_in_available_at(attendance.attendance_date)
+        return False, available_at
+    return False, None
 
 
 def duration_to_hours(value):

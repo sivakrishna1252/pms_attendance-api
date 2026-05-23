@@ -1,4 +1,4 @@
-from apps.attendance.calendar import holiday_info_for_date, iter_dates, resolve_report_date_range
+from apps.attendance.calendar import holiday_info_for_date, is_working_day, iter_dates, resolve_report_date_range
 from apps.attendance.models import AttendanceLog
 from apps.attendance.status_rules import resolve_work_day_status
 from apps.attendance.views import is_late_check_in, leave_flags_for_date
@@ -29,14 +29,15 @@ def _attendance_logs_by_employee_date(attendance_queryset):
 
 def _display_status_for_day(*, employee_id, day, log, on_leave_ids, wfh_ids):
     is_holiday, holiday_name = holiday_info_for_date(day)
-    if is_holiday and (log is None or not log.check_in_time):
-        return "Holiday", holiday_name, "-", "-", "-"
+
+    if employee_id in on_leave_ids and (log is None or not log.check_in_time):
+        return "Absent", "", "-", "-", "-"
 
     if employee_id in wfh_ids and (log is None or not log.check_in_time):
         return "WFH", "", "-", "-", "-"
 
-    if employee_id in on_leave_ids and (log is None or not log.check_in_time):
-        return "Absent", "", "-", "-", "-"
+    if is_holiday and (log is None or not log.check_in_time):
+        return "Holiday", holiday_name, "-", "-", "-"
 
     if log and log.check_in_time:
         from apps.attendance.views import format_time
@@ -63,6 +64,72 @@ def _display_status_for_day(*, employee_id, day, log, on_leave_ids, wfh_ids):
         return status, "", check_in, check_out, work_hours
 
     return "—", "", "-", "-", "-"
+
+
+PRESENT_STATUSES = frozenset({"Present", "Late", "Overtime"})
+HALF_DAY_STATUSES = frozenset({"Half Day", "1/3"})
+
+
+def compute_attendance_status_totals(rows, *, start_date, end_date):
+    """Aggregate day counts for the attendance summary footer row."""
+    working_days = sum(
+        1 for day in iter_dates(start_date, end_date) if is_working_day(day)
+    )
+    totals = {
+        "working_days": working_days,
+        "present": 0,
+        "absent": 0,
+        "holiday": 0,
+        "wfh": 0,
+        "half_day": 0,
+        "late": 0,
+        "overtime": 0,
+        "not_recorded": 0,
+    }
+
+    for row in rows:
+        if row.get("is_summary"):
+            continue
+        status = (row.get("status") or "").strip()
+        if status in PRESENT_STATUSES:
+            totals["present"] += 1
+            if status == "Late":
+                totals["late"] += 1
+            elif status == "Overtime":
+                totals["overtime"] += 1
+        elif status in HALF_DAY_STATUSES:
+            totals["half_day"] += 1
+        elif status == "Absent":
+            totals["absent"] += 1
+        elif status == "Holiday":
+            totals["holiday"] += 1
+        elif status == "WFH":
+            totals["wfh"] += 1
+        elif status in {"—", "-", ""}:
+            totals["not_recorded"] += 1
+
+    return totals
+
+
+def build_attendance_summary_row(totals):
+    return {
+        "employee_name": "TOTAL",
+        "date": "",
+        "day": "",
+        "status": "Summary",
+        "note": (
+            f"Working Days: {totals['working_days']} | "
+            f"Present: {totals['present']} | "
+            f"Absent: {totals['absent']} | "
+            f"Holiday: {totals['holiday']} | "
+            f"WFH: {totals['wfh']} | "
+            f"Half Day: {totals['half_day']}"
+        ),
+        "check_in": "-",
+        "check_out": "-",
+        "work_hours": "-",
+        "is_summary": True,
+    }
 
 
 def build_attendance_report_rows(

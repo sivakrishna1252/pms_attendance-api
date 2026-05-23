@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from .models import Holiday, LeaveBalance, LeaveRequest
-from .services import validate_leave_application
+from .services import leave_days_between, validate_leave_application
 
 
 class LeaveRequestSerializer(serializers.ModelSerializer):
@@ -44,7 +44,7 @@ class LeaveRequestSerializer(serializers.ModelSerializer):
         ]
 
     def get_duration_days(self, obj) -> int:
-        return max((obj.to_date - obj.from_date).days + 1, 1)
+        return leave_days_between(obj.from_date, obj.to_date)
 
     def validate(self, attrs):
         employee_id = self.context.get("employee_id")
