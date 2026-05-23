@@ -206,6 +206,13 @@ class AttendanceReportsAPIView(APIView):
                 employee_id=employee_id,
                 staff_ids=staff_ids,
             )
+            if report_type == REPORT_TYPE_LEAVE:
+                leaves = leaves.filter(
+                    status__in=[
+                        LeaveRequest.Status.APPROVED,
+                        LeaveRequest.Status.REJECTED,
+                    ],
+                )
 
         resolver = resolver_from_request(request)
         seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
