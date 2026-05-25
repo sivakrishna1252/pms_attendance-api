@@ -335,13 +335,15 @@ class PendingLeaveRequestsAPIView(APIView):
         responses={200: LeaveRequestSerializer(many=True)},
     )
     def get(self, request):
+        resolver = resolver_from_request(request)
+        seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
         pending = list(_pending_leave_requests_qs().order_by("-created_at"))
         return Response(
             {
                 "success": True,
                 "message": "Pending leave requests fetched successfully.",
                 "pending_count": len(pending),
-                "requests": [leave_card(item, None) for item in pending],
+                "requests": [leave_card(item, resolver) for item in pending],
             }
         )
 

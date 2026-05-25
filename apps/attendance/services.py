@@ -198,6 +198,9 @@ def apply_auto_checkout_if_needed(
     if attendance is None or attendance.check_out_time is not None or not attendance.check_in_time:
         return attendance
 
+    if attendance.attendance_date < timezone.localdate():
+        notify = False
+
     should_stop, pass_label, work_end_at, _system_stop_at = decide_auto_stop(
         attendance,
         phase=phase,

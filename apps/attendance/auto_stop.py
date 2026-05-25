@@ -145,6 +145,25 @@ def decide_auto_stop(attendance: AttendanceLog, *, phase=None, now=None, force_f
     if attendance.check_out_time is not None or not attendance.check_in_time:
         return False, None, None, None
 
+    today = timezone.localdate()
+    if attendance.attendance_date < today:
+        final_cutoff = stop_cutoff_on(
+            attendance.attendance_date,
+            AUTO_STOP_FINAL_HOUR,
+            AUTO_STOP_FINAL_MINUTE,
+        )
+        activity = last_activity_at(attendance)
+        if (
+            attendance.last_activity_at
+            and attendance.last_activity_at > attendance.check_in_time
+        ):
+            work_end_at = min(final_cutoff, activity)
+        else:
+            work_end_at = final_cutoff
+        if attendance.check_in_time and work_end_at < attendance.check_in_time:
+            work_end_at = attendance.check_in_time
+        return True, PASS_9PM_FORCED, work_end_at, final_cutoff
+
     phase = phase or resolve_auto_stop_phase(timezone.localtime(now), force_final=force_final)
     if phase is None:
         return False, None, None, None

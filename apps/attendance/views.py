@@ -1289,6 +1289,7 @@ class AdminAttendanceHistoryAPIView(APIView):
         staff_ids = parse_staff_ids_param(request.query_params.get("staff_ids", ""))
 
         if attendance_date and not start_date and not end_date:
+            process_open_attendance_records(notify=False)
             day_payload = build_admin_day_payload(
                 attendance_date,
                 resolver=resolver,
