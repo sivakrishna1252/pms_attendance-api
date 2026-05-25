@@ -15,9 +15,20 @@ from apps.common.employee_profiles import resolver_from_request, seed_staff_reso
 from apps.common.pms_client import staff_users_from_pms
 from apps.leaves.models import LeaveRequest
 
-from .calendar import holiday_info_for_date, is_company_holiday, shift_label_for_date
+from .calendar import (
+    holiday_info_for_date,
+    is_company_holiday,
+    is_working_day,
+    iter_dates,
+    shift_label_for_date,
+)
 
-from .constants import LATE_CHECK_IN_HOUR, LATE_CHECK_IN_MINUTE
+from .constants import (
+    AUTO_STOP_FIRST_HOUR,
+    AUTO_STOP_FIRST_MINUTE,
+    LATE_CHECK_IN_HOUR,
+    LATE_CHECK_IN_MINUTE,
+)
 from .models import AttendanceLog
 from .serializers import AttendanceLogSerializer
 from .status_rules import resolve_work_day_status
@@ -102,7 +113,7 @@ def apply_display_status(record):
     elif status == "WFH":
         record["display_status"] = "WFH"
     elif status == "ON_LEAVE":
-        record["display_status"] = "Absent"
+        record["display_status"] = "Leave"
     elif status == "ABSENT":
         record["display_status"] = "Absent"
     elif record.get("has_check_in"):
@@ -371,6 +382,177 @@ def build_history_summary(queryset):
     }
 
 
+PRESENT_DISPLAY_STATUSES = frozenset(
+    {"Present", "Late", "Overtime", "Half Day", "1/3", "Checked Out"}
+)
+
+
+def absent_marking_time_reached(day):
+    """Employee absent status is only shown after 8:00 PM on that day."""
+    today = timezone.localdate()
+    if day < today:
+        return True
+    if day > today:
+        return False
+    now = timezone.localtime()
+    cutoff = now.replace(
+        hour=AUTO_STOP_FIRST_HOUR,
+        minute=AUTO_STOP_FIRST_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    return now >= cutoff
+
+
+def record_has_check_out(record):
+    return record.get("check_out") not in (None, "-", "")
+
+
+def apply_staff_history_display(record, day, employee_id):
+    """
+    Simplified staff dashboard statuses (Employee + BA):
+    - Present: check-in and check-out both done
+    - Leave / WFH: approved permission
+    - Holiday: admin calendar + company off days (Sunday, 1st/3rd Saturday)
+    - Absent: no check-in, no leave, working day, after 8 PM
+    """
+    on_leave_ids, wfh_ids = leave_flags_for_date(day)
+    is_holiday, holiday_name = holiday_info_for_date(day)
+    has_check_in = bool(
+        record.get("has_check_in") or record.get("check_in") not in (None, "-", "")
+    )
+    has_check_out = record_has_check_out(record)
+    record["has_check_in"] = has_check_in
+
+    if employee_id in on_leave_ids and not has_check_in:
+        record["display_status"] = "Leave"
+        record["status_label"] = "Leave"
+        record["attendance_type"] = "Leave"
+        return record
+
+    if employee_id in wfh_ids:
+        record["display_status"] = "WFH"
+        record["status_label"] = "WFH"
+        record["attendance_type"] = "WFH"
+        return record
+
+    if is_holiday and not has_check_in:
+        record["display_status"] = "Holiday"
+        record["status_label"] = "Holiday"
+        record["attendance_type"] = "Holiday"
+        record["holiday_name"] = holiday_name
+        return record
+
+    if has_check_in and has_check_out:
+        record["display_status"] = "Present"
+        record["status_label"] = "Present"
+        return record
+
+    if is_working_day(day) and not has_check_in and absent_marking_time_reached(day):
+        record["display_status"] = "Absent"
+        record["status_label"] = "Absent"
+        record["attendance_type"] = "Absent"
+        return record
+
+    # Today before 8 PM (or check-in without check-out): not shown yet
+    record["display_status"] = None
+    record["status_label"] = None
+    return record
+
+
+def summarize_staff_history_records(records):
+    present = sum(1 for item in records if item.get("display_status") == "Present")
+    absent = sum(1 for item in records if item.get("display_status") == "Absent")
+    leave = sum(1 for item in records if item.get("display_status") == "Leave")
+    holiday = sum(1 for item in records if item.get("display_status") == "Holiday")
+    wfh = sum(1 for item in records if item.get("display_status") == "WFH")
+    checked_out = sum(
+        1
+        for item in records
+        if item.get("check_out") not in (None, "-", "")
+    )
+    auto_checked_out = sum(1 for item in records if item.get("auto_checked_out"))
+    return {
+        "present": present,
+        "absent": absent,
+        "leave": leave,
+        "holiday": holiday,
+        "wfh": wfh,
+        "checked_out": checked_out,
+        "auto_checked_out": auto_checked_out,
+        "total_records": len(records),
+    }
+
+
+def summarize_history_records(records):
+    present = sum(
+        1
+        for item in records
+        if item.get("has_check_in")
+        or item.get("display_status") in PRESENT_DISPLAY_STATUSES
+    )
+    absent = sum(1 for item in records if item.get("display_status") == "Absent")
+    leave = sum(
+        1
+        for item in records
+        if item.get("display_status") == "Leave" or item.get("status") == "ON_LEAVE"
+    )
+    holiday = sum(1 for item in records if item.get("display_status") == "Holiday")
+    wfh = sum(1 for item in records if item.get("display_status") == "WFH")
+    checked_out = sum(
+        1
+        for item in records
+        if item.get("check_out") not in (None, "-", "")
+    )
+    auto_checked_out = sum(1 for item in records if item.get("auto_checked_out"))
+    return {
+        "present": present,
+        "absent": absent,
+        "leave": leave,
+        "holiday": holiday,
+        "wfh": wfh,
+        "checked_out": checked_out,
+        "auto_checked_out": auto_checked_out,
+        "total_records": len(records),
+    }
+
+
+def build_staff_history_payload(employee_id, *, start_date=None, end_date=None):
+    today = timezone.localdate()
+    end_date = min(end_date or today, today)
+
+    logs_qs = AttendanceLog.objects.filter(employee_id=employee_id)
+    if start_date:
+        logs_qs = logs_qs.filter(attendance_date__gte=start_date)
+    logs_qs = logs_qs.filter(attendance_date__lte=end_date)
+    logs_by_date = {log.attendance_date: log for log in logs_qs.order_by("attendance_date")}
+
+    if start_date:
+        range_start = start_date
+    elif logs_by_date:
+        range_start = min(logs_by_date.keys())
+    else:
+        range_start = end_date - timedelta(days=30)
+
+    records = []
+    for day in iter_dates(range_start, end_date):
+        if day in logs_by_date:
+            record = format_attendance_record(logs_by_date[day])
+        else:
+            record = format_no_checkin_record(employee_id, day, None, as_absent=False)
+
+        apply_staff_history_display(record, day, employee_id)
+        if not record.get("display_status"):
+            continue
+        records.append(record)
+
+    records.sort(key=lambda item: item["date"], reverse=True)
+    return {
+        "records": records,
+        "summary": summarize_staff_history_records(records),
+    }
+
+
 def approved_leaves_on_date(attendance_date):
     return LeaveRequest.objects.filter(
         status=LeaveRequest.Status.APPROVED,
@@ -457,7 +639,7 @@ def format_leave_only_record(employee_id, attendance_date, resolver, *, is_wfh=F
         }
     )
     status = "WFH" if is_wfh else "ON_LEAVE"
-    status_label = "WFH" if is_wfh else "Absent"
+    status_label = "WFH" if is_wfh else "Leave"
     display_status = status_label
     return {
         "id": None,
@@ -571,11 +753,7 @@ def annotate_attendance_day_context(record, *, on_leave_ids, wfh_ids, is_holiday
     has_check_in = record.get("check_in") not in (None, "-", "")
     record["has_check_in"] = has_check_in
 
-    if employee_id in on_leave_ids and not has_check_in:
-        record["status"] = "ON_LEAVE"
-        record["status_label"] = "Leave"
-        record["attendance_type"] = "Leave"
-    elif employee_id in wfh_ids:
+    if employee_id in wfh_ids:
         record["status"] = "WFH"
         record["status_label"] = "WFH"
         record["attendance_type"] = "WFH"
@@ -715,19 +893,15 @@ def build_admin_day_payload(
     )
     if not target_employee_ids:
         target_employee_ids = sorted(
-            set(records_by_employee.keys()) | on_leave_ids | wfh_ids
+            set(records_by_employee.keys()) | wfh_ids
         )
 
     for emp_id in target_employee_ids:
         if emp_id in records_by_employee:
             continue
         if emp_id in on_leave_ids:
-            records_by_employee[emp_id] = format_leave_only_record(
-                emp_id,
-                attendance_date,
-                resolver,
-                is_wfh=False,
-            )
+            # Approved leave is shown in Leave Management — admin attendance lists check-ins only.
+            continue
         elif emp_id in wfh_ids:
             records_by_employee[emp_id] = format_leave_only_record(
                 emp_id,
@@ -793,8 +967,11 @@ def build_admin_day_payload(
         1 for item in records_by_employee.values() if item.get("display_status") == "Holiday"
     )
     if employee_id:
-        absent_count = 1 if int(employee_id) in on_leave_ids else (
-            1 if records_by_employee.get(int(employee_id), {}).get("display_status") == "Absent" else 0
+        absent_count = (
+            1
+            if records_by_employee.get(int(employee_id), {}).get("display_status")
+            == "Absent"
+            else 0
         )
         holiday_count = (
             1 if records_by_employee.get(int(employee_id), {}).get("display_status") == "Holiday" else 0
@@ -1038,7 +1215,7 @@ class AttendanceActivityAPIView(APIView):
 class AttendanceHistoryAPIView(APIView):
     @extend_schema(
         tags=["Attendance"],
-        summary="Employee attendance history",
+        summary="Employee/BA staff attendance history",
         responses={200: AttendanceLogSerializer(many=True)},
     )
     def get(self, request):
@@ -1046,20 +1223,21 @@ class AttendanceHistoryAPIView(APIView):
         process_open_attendance_records(
             AttendanceLog.objects.filter(employee_id=employee_id, check_out_time__isnull=True)
         )
-        attendance = AttendanceLog.objects.filter(employee_id=employee_id)
         start_date = parse_date(request.query_params.get("start_date", ""))
         end_date = parse_date(request.query_params.get("end_date", ""))
-        if start_date:
-            attendance = attendance.filter(attendance_date__gte=start_date)
-        if end_date:
-            attendance = attendance.filter(attendance_date__lte=end_date)
+
+        history = build_staff_history_payload(
+            employee_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         return Response(
             {
                 "success": True,
                 "message": "Attendance history fetched successfully.",
-                "summary": build_history_summary(attendance),
-                "records": [format_attendance_record(item) for item in attendance[:200]],
+                "summary": history["summary"],
+                "records": history["records"][:200],
             }
         )
 
