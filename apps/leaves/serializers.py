@@ -68,10 +68,30 @@ class LeaveRequestSerializer(serializers.ModelSerializer):
 
 
 class HolidaySerializer(serializers.ModelSerializer):
+    date = serializers.DateField(source="holiday_date", required=False, write_only=True)
+
     class Meta:
         model = Holiday
-        fields = ["id", "name", "holiday_date", "description", "is_active", "created_at"]
+        fields = [
+            "id",
+            "name",
+            "holiday_date",
+            "date",
+            "description",
+            "is_active",
+            "created_at",
+        ]
         read_only_fields = ["id", "created_at"]
+        extra_kwargs = {
+            "holiday_date": {"required": False},
+        }
+
+    def validate(self, attrs):
+        if not attrs.get("holiday_date"):
+            raise serializers.ValidationError(
+                {"holiday_date": ["This field is required."]}
+            )
+        return attrs
 
 
 class LeaveApprovalSerializer(serializers.Serializer):
