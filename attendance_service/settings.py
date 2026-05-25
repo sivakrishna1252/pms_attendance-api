@@ -133,6 +133,10 @@ ADMIN_EMPLOYEE_IDS = {
 # Production: set PMS_API_BASE_URL in .env (see .env.example).
 PMS_API_BASE_URL = config("PMS_API_BASE_URL", default="http://127.0.0.1:8000/api/v1").strip().rstrip("/")
 PMS_SERVICE_TOKEN = config("PMS_SERVICE_TOKEN", default="")
+PMS_FRONTEND_URL = config(
+    "PMS_FRONTEND_URL",
+    default="https://nexus-pms.aspune.cloud",
+).strip().rstrip("/")
 
 EMAIL_BACKEND = config("EMAIL_BACKEND", default="django.core.mail.backends.smtp.EmailBackend")
 EMAIL_HOST = config("EMAIL_HOST", default="smtp.gmail.com")
@@ -142,3 +146,17 @@ EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=True, cast=bool)
 EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="") or config("SMTP_USER", default="")
 EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="") or config("SMTP_PASS", default="")
 DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default=EMAIL_HOST_USER)
+
+LEAVE_REQUEST_TO_EMAIL = config(
+    "LEAVE_REQUEST_TO_EMAIL",
+    default="harsh.singh@apparatus.solutions",
+).strip()
+LEAVE_REQUEST_CC_EMAILS = [
+    email.strip()
+    for email in config(
+        "LEAVE_REQUEST_CC_EMAILS",
+        default="Vivek@apparatus.solutions,Rishabh@apparatus.solutions",
+        cast=Csv(),
+    )
+    if email.strip()
+]
