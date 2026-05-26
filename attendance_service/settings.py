@@ -122,6 +122,11 @@ CORS_ALLOWED_ORIGINS = config(
     cast=Csv(),
 )
 CORS_ALLOW_CREDENTIALS = True
+CORS_EXPOSE_HEADERS = [
+    "Content-Disposition",
+    "Content-Type",
+    "Content-Length",
+]
 
 ADMIN_EMPLOYEE_IDS = {
     int(value)

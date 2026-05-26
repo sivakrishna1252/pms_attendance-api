@@ -32,6 +32,7 @@ from .constants import (
 from .models import AttendanceLog
 from .serializers import AttendanceLogSerializer
 from .status_rules import resolve_work_day_status
+from .admin_status_override import AdminAttendanceEditError, apply_admin_attendance_edit
 from .auto_stop import resolve_auto_stop_phase
 from .services import (
     apply_auto_checkout_if_needed,
@@ -107,6 +108,12 @@ def resolve_record_is_late(record):
 
 
 def apply_display_status(record):
+    admin_status = (record.get("admin_display_status") or "").strip()
+    if admin_status:
+        record["display_status"] = admin_status
+        record["status_label"] = admin_status
+        return record
+
     status = record.get("status")
     if status == "HOLIDAY":
         record["display_status"] = "Holiday"
@@ -235,6 +242,7 @@ def format_attendance_record(attendance, resolver=None):
         ),
         "has_check_in": bool(attendance.check_in_time),
         "is_late": is_late_check_in(attendance.check_in_time),
+        "admin_display_status": getattr(attendance, "admin_display_status", "") or None,
         "work_analysis": analysis,
         "raw": AttendanceLogSerializer(attendance).data,
     }
@@ -308,6 +316,20 @@ def build_today_payload(attendance, *, employee_id=None):
 
     analysis = work_analysis(attendance) if attendance else None
 
+    today_log_display_status = None
+    if attendance and has_check_in and checked_out:
+        worked = (analysis or {}).get("work_hours")
+        total_work_hours = attendance.total_work_hours
+        if total_work_hours is None and isinstance(worked, (int, float)):
+            total_work_hours = timedelta(hours=worked)
+        today_log_display_status = resolve_work_day_status(
+            day=today,
+            check_in_time=attendance.check_in_time,
+            total_work_hours=total_work_hours,
+            is_late=is_late_check_in(attendance.check_in_time),
+            auto_checked_out=bool(attendance.auto_checked_out),
+        )
+
     return {
         "date": today.isoformat(),
         "is_holiday": is_holiday,
@@ -336,6 +358,7 @@ def build_today_payload(attendance, *, employee_id=None):
             "check_in": format_time(attendance.check_in_time) if has_check_in else None,
             "check_out": format_time(attendance.check_out_time) if checked_out else None,
             "duration": format_duration(attendance.total_work_hours) if checked_out else None,
+            "display_status": today_log_display_status,
             "work_analysis": analysis,
             "timeline": (
                 [
@@ -383,7 +406,7 @@ def build_history_summary(queryset):
 
 
 PRESENT_DISPLAY_STATUSES = frozenset(
-    {"Present", "Late", "Overtime", "Half Day", "1/3", "Checked Out"}
+    {"Present", "Late", "Overtime", "Checked Out"}
 )
 
 
@@ -444,8 +467,31 @@ def apply_staff_history_display(record, day, employee_id):
         return record
 
     if has_check_in and has_check_out:
-        record["display_status"] = "Present"
-        record["status_label"] = "Present"
+        analysis = record.get("work_analysis") or {}
+        worked = analysis.get("work_hours")
+        total_work_hours = None
+        if isinstance(worked, (int, float)):
+            total_work_hours = timedelta(hours=worked)
+
+        check_in_dt = None
+        raw_check_in = record.get("check_in_time")
+        if raw_check_in:
+            parsed = parse_datetime(raw_check_in)
+            if parsed:
+                if timezone.is_naive(parsed):
+                    parsed = timezone.make_aware(
+                        parsed, timezone.get_current_timezone()
+                    )
+                check_in_dt = parsed
+
+        record["display_status"] = resolve_work_day_status(
+            day=day,
+            check_in_time=check_in_dt or True,
+            total_work_hours=total_work_hours,
+            is_late=resolve_record_is_late(record),
+            auto_checked_out=bool(record.get("auto_checked_out")),
+        )
+        record["status_label"] = record["display_status"]
         return record
 
     if is_working_day(day) and not has_check_in and absent_marking_time_reached(day):
@@ -461,7 +507,16 @@ def apply_staff_history_display(record, day, employee_id):
 
 
 def summarize_staff_history_records(records):
-    present = sum(1 for item in records if item.get("display_status") == "Present")
+    present = sum(
+        1
+        for item in records
+        if item.get("display_status") in {"Present", "Late", "Overtime"}
+    )
+    half_day = sum(
+        1
+        for item in records
+        if item.get("display_status") in {"Half Day", "Auto Stop Half Day"}
+    )
     absent = sum(1 for item in records if item.get("display_status") == "Absent")
     leave = sum(1 for item in records if item.get("display_status") == "Leave")
     holiday = sum(1 for item in records if item.get("display_status") == "Holiday")
@@ -474,6 +529,7 @@ def summarize_staff_history_records(records):
     auto_checked_out = sum(1 for item in records if item.get("auto_checked_out"))
     return {
         "present": present,
+        "half_day": half_day,
         "absent": absent,
         "leave": leave,
         "holiday": holiday,
@@ -1422,5 +1478,96 @@ class AdminDashboardAPIView(APIView):
                         )[:10]
                     ],
                 },
+            }
+        )
+
+
+class AdminAttendanceStatusOverrideAPIView(APIView):
+    permission_classes = [IsAttendanceAdmin]
+
+    @extend_schema(
+        tags=["Admin Attendance"],
+        summary="Admin edit attendance record",
+        description=(
+            "Allows admins to override display status and check-in/check-out times "
+            "for an employee on a given date."
+        ),
+    )
+    def patch(self, request):
+        payload = request.data if isinstance(request.data, dict) else {}
+        employee_id = payload.get("employee_id")
+        attendance_date = parse_date(str(payload.get("date") or ""))
+        attendance_log_id = payload.get("attendance_log_id")
+
+        if employee_id is None or attendance_date is None:
+            return Response(
+                {
+                    "success": False,
+                    "message": "employee_id and date are required.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            employee_id = int(employee_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"success": False, "message": "employee_id must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if attendance_log_id is not None:
+            try:
+                attendance_log_id = int(attendance_log_id)
+            except (TypeError, ValueError):
+                return Response(
+                    {
+                        "success": False,
+                        "message": "attendance_log_id must be an integer.",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        admin_id = getattr(request.user, "employee_id", None)
+        if admin_id is not None:
+            admin_id = int(admin_id)
+
+        has_display_status = "display_status" in payload
+        has_check_in = "check_in" in payload
+        has_check_out = "check_out" in payload
+        if not has_display_status and not has_check_in and not has_check_out:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Provide display_status, check_in, and/or check_out to update.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            attendance = apply_admin_attendance_edit(
+                employee_id=employee_id,
+                attendance_date=attendance_date,
+                admin_id=admin_id,
+                attendance_log_id=attendance_log_id,
+                display_status=(
+                    payload.get("display_status") if has_display_status else None
+                ),
+                check_in=payload.get("check_in") if has_check_in else None,
+                check_out=payload.get("check_out") if has_check_out else None,
+            )
+        except AdminAttendanceEditError as exc:
+            return Response(
+                {"success": False, "message": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        resolver = resolver_from_request(request)
+        record = format_attendance_record(attendance, resolver)
+        return Response(
+            {
+                "success": True,
+                "message": "Attendance updated successfully.",
+                "data": record,
             }
         )

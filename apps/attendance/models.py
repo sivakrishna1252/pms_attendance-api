@@ -17,6 +17,9 @@ class AttendanceLog(models.Model):
     capped_at_standard_hours = models.BooleanField(default=False)
     forgot_checkout_email_sent = models.BooleanField(default=False)
     last_activity_at = models.DateTimeField(null=True, blank=True)
+    admin_display_status = models.CharField(max_length=20, blank=True, default="")
+    admin_overridden_at = models.DateTimeField(null=True, blank=True)
+    admin_overridden_by = models.IntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

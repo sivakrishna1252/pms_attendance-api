@@ -67,7 +67,7 @@ def _display_status_for_day(*, employee_id, day, log, on_leave_ids, wfh_ids):
 
 
 PRESENT_STATUSES = frozenset({"Present", "Late", "Overtime"})
-HALF_DAY_STATUSES = frozenset({"Half Day", "1/3"})
+HALF_DAY_STATUSES = frozenset({"Half Day", "Auto Stop Half Day"})
 
 
 def compute_attendance_status_totals(rows, *, start_date, end_date):

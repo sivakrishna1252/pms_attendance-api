@@ -1,14 +1,6 @@
 from datetime import timedelta
 
-from .constants import (
-    ABSENT_MAX_HOURS,
-    HALF_DAY_MAX_HOURS,
-    PRESENT_MAX_HOURS,
-    PRESENT_MIN_HOURS,
-    THIRD_DAY_MAX_HOURS,
-)
-
-THIRD_DAY_STATUS_LABEL = "1/3"
+from .constants import ABSENT_MAX_HOURS, PRESENT_MAX_HOURS, PRESENT_MIN_HOURS
 
 
 def worked_hours_value(total_work_hours) -> float:
@@ -28,29 +20,34 @@ def resolve_work_day_status(
     """
     Display status for employees who checked in.
 
-    - Check-in before/at 11 AM + short hours → Present (not Late)
-    - Check-in after 11 AM + short hours → Late
-    - Check-in after 11 AM + 7–9 h (e.g. 9 h) → Present
-    - > 9 h → Overtime
-    - 5–7 h → 1/3, 2–5 h → Half Day
+    Manual checkout:
+    - 0–5 h → Absent
+    - >5 h and <8 h → Half Day
+    - 8–9 h → Present (Late if check-in after 11 AM)
+    - >9 h → Overtime
 
-    No check-in: caller uses Absent (approved leave) or — (dash).
+    Auto Stop (forgot check-out):
+    - ≤5 h → Absent
+    - >5 h → Auto Stop Half Day (never Present/Overtime, even if 8+ h recorded)
     """
-    del day, auto_checked_out
+    del day
 
     if not check_in_time:
         return "Absent"
 
     hours = worked_hours_value(total_work_hours)
 
+    if auto_checked_out:
+        if hours <= ABSENT_MAX_HOURS:
+            return "Absent"
+        return "Auto Stop Half Day"
+
+    if hours <= ABSENT_MAX_HOURS:
+        return "Absent"
+    if hours < PRESENT_MIN_HOURS:
+        return "Half Day"
     if hours > PRESENT_MAX_HOURS:
         return "Overtime"
-    if hours >= PRESENT_MIN_HOURS:
-        return "Present"
-    if HALF_DAY_MAX_HOURS < hours < THIRD_DAY_MAX_HOURS:
-        return THIRD_DAY_STATUS_LABEL
-    if ABSENT_MAX_HOURS < hours <= HALF_DAY_MAX_HOURS:
-        return "Half Day"
     if is_late:
         return "Late"
     return "Present"

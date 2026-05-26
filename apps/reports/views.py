@@ -77,7 +77,7 @@ def _apply_employee_filters(queryset, *, employee_id=None, staff_ids=None):
     return queryset
 
 
-def _write_csv_response(filename, columns, rows, *, excel_compatible=False):
+def _write_csv_response(filename, column_keys, column_labels, rows, *, excel_compatible=False):
     content_type = "text/csv"
     if excel_compatible:
         content_type = "application/vnd.ms-excel"
@@ -87,9 +87,9 @@ def _write_csv_response(filename, columns, rows, *, excel_compatible=False):
     response.write("\ufeff")
 
     writer = csv.writer(response)
-    writer.writerow(columns)
+    writer.writerow(column_labels)
     for row in rows:
-        writer.writerow([row.get(column, "") for column in columns])
+        writer.writerow([row.get(key, "") for key in column_keys])
     return response
 
 
@@ -97,9 +97,12 @@ def _escape_pdf_text(value):
     return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def _write_pdf_response(filename, title, columns, rows):
-    lines = [title, "", " | ".join(columns)]
-    lines.extend(" | ".join(str(row.get(column, "")) for column in columns) for row in rows[:120])
+def _write_pdf_response(filename, title, column_keys, column_labels, rows):
+    lines = [title, "", " | ".join(column_labels)]
+    lines.extend(
+        " | ".join(str(row.get(key, "")) for key in column_keys)
+        for row in rows[:120]
+    )
     if len(rows) > 120:
         lines.append(f"... and {len(rows) - 120} more rows. Download CSV/Excel for full data.")
 
@@ -344,6 +347,7 @@ class AttendanceReportsAPIView(APIView):
             filename = f"{report_type}_{start_date}_{end_date}.{extension}"
             return _write_csv_response(
                 filename,
+                preview_columns,
                 export_headers,
                 export_rows,
                 excel_compatible=export_format == EXPORT_FORMAT_EXCEL,
@@ -353,6 +357,7 @@ class AttendanceReportsAPIView(APIView):
             return _write_pdf_response(
                 filename,
                 f"{report_title} ({start_date} - {end_date})",
+                preview_columns,
                 export_headers,
                 export_rows,
             )
