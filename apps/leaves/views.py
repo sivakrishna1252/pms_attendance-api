@@ -13,8 +13,10 @@ from .models import Holiday, LeaveBalance, LeaveRequest
 from .serializers import HolidaySerializer, LeaveApprovalSerializer, LeaveBalanceSerializer, LeaveRequestSerializer
 from .notifications import notify_admins_leave_submitted, notify_employee_leave_decision
 from .services import (
+    apply_leave_history_retention,
     deduct_leave_balance,
     leave_days_between,
+    LEAVE_HISTORY_RETENTION_MONTHS,
     send_leave_status_email,
     upcoming_holidays,
 )
@@ -275,6 +277,7 @@ class LeaveHistoryAPIView(APIView):
         employee_id = employee_id_from_request(request)
         status_filter = (request.query_params.get("status") or "").upper()
         leave_requests = LeaveRequest.objects.filter(employee_id=employee_id)
+        leave_requests = apply_leave_history_retention(leave_requests)
         if status_filter in LeaveRequest.Status.values:
             leave_requests = leave_requests.filter(status=status_filter)
         balance = get_or_create_leave_balance(employee_id)
@@ -282,6 +285,7 @@ class LeaveHistoryAPIView(APIView):
             {
                 "success": True,
                 "message": "Leave history fetched successfully.",
+                "retention_months": LEAVE_HISTORY_RETENTION_MONTHS,
                 "balances": balance_cards(balance),
                 "requests": [leave_card(item) for item in leave_requests],
             }
@@ -359,7 +363,9 @@ class AdminLeaveListAPIView(APIView):
         resolver = resolver_from_request(request)
         seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
         status_filter = (request.query_params.get("status") or "").upper()
-        leave_requests = LeaveRequest.objects.all().order_by("-created_at")
+        leave_requests = apply_leave_history_retention(LeaveRequest.objects.all()).order_by(
+            "-created_at"
+        )
         if status_filter in LeaveRequest.Status.values:
             leave_requests = leave_requests.filter(status=status_filter)
 
@@ -368,13 +374,16 @@ class AdminLeaveListAPIView(APIView):
             LeaveRequest.Status.APPROVED: 0,
             LeaveRequest.Status.REJECTED: 0,
         }
-        for row in LeaveRequest.objects.values("status").annotate(total=Count("id")):
+        for row in apply_leave_history_retention(LeaveRequest.objects.all()).values(
+            "status"
+        ).annotate(total=Count("id")):
             counts[row["status"]] = row["total"]
 
         return Response(
             {
                 "success": True,
                 "message": "Leave requests fetched successfully.",
+                "retention_months": LEAVE_HISTORY_RETENTION_MONTHS,
                 "counts": counts,
                 "requests": [leave_card(item, resolver) for item in leave_requests[:200]],
             }

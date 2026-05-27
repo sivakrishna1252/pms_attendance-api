@@ -48,6 +48,7 @@ def _display_status_for_day(*, employee_id, day, log, on_leave_ids, wfh_ids):
             total_work_hours=log.total_work_hours,
             is_late=is_late_check_in(log.check_in_time),
             auto_checked_out=bool(log.auto_checked_out),
+            has_check_out=log.check_out_time is not None,
         )
         check_in = format_time(log.check_in_time)
         check_out = format_time(log.check_out_time)

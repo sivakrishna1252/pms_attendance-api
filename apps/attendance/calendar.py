@@ -105,6 +105,43 @@ def months_ago(reference: date, months: int) -> date:
     return date(year, month, day)
 
 
+def month_plus(reference: date, months: int) -> date:
+    month = reference.month + months
+    year = reference.year
+    while month > 12:
+        month -= 12
+        year += 1
+
+    import calendar
+
+    day = min(reference.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+ATTENDANCE_HISTORY_CLEAR_DAY = 6
+
+
+def resolve_staff_attendance_history_window(*, today=None):
+    """
+    Employee/BA attendance history window:
+    - Before the 6th: show previous month 1st through current month 6th.
+    - From the 6th onward: show current month 1st through next month 6th.
+    On each 6th the prior month rolls off (e.g. July 6 clears June).
+    """
+    from django.utils import timezone
+
+    today = today or timezone.localdate()
+    if today.day < ATTENDANCE_HISTORY_CLEAR_DAY:
+        window_start = months_ago(today.replace(day=1), 1)
+        window_end = today.replace(day=ATTENDANCE_HISTORY_CLEAR_DAY)
+    else:
+        window_start = today.replace(day=1)
+        window_end = month_plus(today.replace(day=1), 1).replace(
+            day=ATTENDANCE_HISTORY_CLEAR_DAY
+        )
+    return window_start, window_end
+
+
 REPORT_RETENTION_MONTHS = 6
 
 

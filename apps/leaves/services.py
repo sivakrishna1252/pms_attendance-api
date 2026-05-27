@@ -1,10 +1,11 @@
 from datetime import timedelta
 from functools import lru_cache
 
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 
-from apps.attendance.calendar import is_working_day, is_working_saturday
+from apps.attendance.calendar import is_working_day, is_working_saturday, months_ago
 from apps.common.email import send_attendance_email
 from apps.common.pms_client import employee_display_name, employee_email, fetch_employee_profile
 
@@ -16,6 +17,31 @@ LEAVE_TYPE_TO_BALANCE_FIELD = {
     LeaveRequest.LeaveType.CASUAL: "casual_leave",
     LeaveRequest.LeaveType.COMPENSATORY: "compensatory_leave",
 }
+
+LEAVE_HISTORY_RETENTION_MONTHS = 3
+
+
+def leave_history_cutoff_date(*, today=None):
+    today = today or timezone.localdate()
+    return months_ago(today, LEAVE_HISTORY_RETENTION_MONTHS)
+
+
+def apply_leave_history_retention(queryset, *, today=None):
+    """Keep pending requests; hide resolved requests older than the retention window."""
+    cutoff = leave_history_cutoff_date(today=today)
+    return queryset.filter(
+        Q(status=LeaveRequest.Status.PENDING) | Q(created_at__date__gte=cutoff)
+    )
+
+
+def purge_expired_leave_history(*, today=None):
+    """Delete approved/rejected leave requests older than the retention window."""
+    cutoff = leave_history_cutoff_date(today=today)
+    deleted, _ = LeaveRequest.objects.filter(
+        status__in=[LeaveRequest.Status.APPROVED, LeaveRequest.Status.REJECTED],
+        created_at__date__lt=cutoff,
+    ).delete()
+    return deleted
 
 
 def iter_dates(from_date, to_date):

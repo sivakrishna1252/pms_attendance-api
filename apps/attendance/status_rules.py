@@ -16,9 +16,14 @@ def resolve_work_day_status(
     total_work_hours,
     is_late=False,
     auto_checked_out=False,
+    has_check_out=True,
 ):
     """
     Display status for employees who checked in.
+
+    Before check-out (still working):
+    - Check-in at or before 11:00 AM → Present
+    - Check-in after 11:00 AM → Late
 
     Manual checkout:
     - 0–5 h → Absent
@@ -34,6 +39,9 @@ def resolve_work_day_status(
 
     if not check_in_time:
         return "Absent"
+
+    if not has_check_out and not auto_checked_out:
+        return "Late" if is_late else "Present"
 
     hours = worked_hours_value(total_work_hours)
 
