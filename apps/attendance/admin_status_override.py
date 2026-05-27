@@ -13,6 +13,7 @@ VALID_ADMIN_DISPLAY_STATUSES = frozenset(
         "Half Day",
         "Overtime",
         "WFH",
+        "Holiday",
     }
 )
 
