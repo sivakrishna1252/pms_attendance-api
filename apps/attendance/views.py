@@ -16,7 +16,6 @@ from apps.common.pms_client import staff_users_from_pms
 from apps.leaves.models import LeaveRequest
 
 from .calendar import (
-    ATTENDANCE_HISTORY_CLEAR_DAY,
     holiday_info_for_date,
     is_company_holiday,
     is_working_day,
@@ -645,7 +644,7 @@ def build_staff_history_payload(employee_id, *, start_date=None, end_date=None):
             "end_date": range_end.isoformat(),
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
-            "clear_day": ATTENDANCE_HISTORY_CLEAR_DAY,
+            "clear_day": window_end.day,
         },
     }
 

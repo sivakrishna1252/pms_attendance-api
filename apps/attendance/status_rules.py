@@ -4,9 +4,13 @@ from .constants import ABSENT_MAX_HOURS, PRESENT_MAX_HOURS, PRESENT_MIN_HOURS
 
 
 def worked_hours_value(total_work_hours) -> float:
+    """Match format_duration (whole hours + minutes) so 8h 00m → 8.0 for status."""
     if not total_work_hours:
         return 0.0
-    return round(total_work_hours.total_seconds() / 3600, 2)
+    total_seconds = int(total_work_hours.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes = remainder // 60
+    return round(hours + minutes / 60, 2)
 
 
 def resolve_work_day_status(
@@ -27,9 +31,9 @@ def resolve_work_day_status(
 
     Manual checkout:
     - 0–5 h → Absent
-    - >5 h and <8 h → Half Day
-    - 8–9 h → Present (Late if check-in after 11 AM)
-    - >9 h → Overtime
+    - >5 h and below 8 h → Half Day
+    - 8 h or more (up to 9 h) → Present (Late if check-in after 11 AM)
+    - above 9 h → Overtime
 
     Auto Stop (forgot check-out):
     - ≤5 h → Absent
@@ -52,10 +56,8 @@ def resolve_work_day_status(
 
     if hours <= ABSENT_MAX_HOURS:
         return "Absent"
-    if hours < PRESENT_MIN_HOURS:
-        return "Half Day"
     if hours > PRESENT_MAX_HOURS:
         return "Overtime"
-    if is_late:
-        return "Late"
-    return "Present"
+    if hours >= PRESENT_MIN_HOURS:
+        return "Late" if is_late else "Present"
+    return "Half Day"
