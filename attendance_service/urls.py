@@ -20,5 +20,6 @@ urlpatterns = [
     path("api/admin/", include("apps.reports.urls")),
     path("api/admin/leaves/", include("apps.leaves.admin_urls")),
     path("api/admin/holidays/", include("apps.leaves.admin_holiday_urls")),
+    path("api/internal/", include("apps.common.internal_urls")),
     path("", home),
 ]

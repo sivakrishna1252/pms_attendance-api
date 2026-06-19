@@ -149,15 +149,15 @@ def _auto_stop_email_body(attendance, *, pass_label: str) -> str:
 
     if pass_label == PASS_8PM:
         reason = (
-            "No activity was detected for at least 1 hour before 8:00 PM. "
+            "No activity was detected for at least 30 minutes before 8:00 PM. "
             "Work hours and attendance status were calculated "
             "from check-in until your last activity time."
         )
     else:
         reason = (
-            "Your session was still open at 9:00 PM. "
-            "Work hours were calculated from check-in until your last activity "
-            "or the end-of-day Auto Stop."
+            "Your session was still open at 9:00 PM (including if you were still "
+            "active after 8:00 PM). Work hours were calculated from check-in until "
+            "your last activity or the end-of-day Auto Stop."
         )
 
     return (

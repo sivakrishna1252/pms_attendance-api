@@ -64,7 +64,7 @@ def inactivity_duration(attendance: AttendanceLog, now=None):
 
 
 def should_auto_stop_first_pass(attendance: AttendanceLog, now=None) -> bool:
-    """8 PM: Auto Stop when inactive for 1 hour or more (e.g. last activity 6:50 or 7:00 PM)."""
+    """8 PM: checkout when inactive 30+ minutes (forgot to check out)."""
     now = now or timezone.now()
     day_cutoff = stop_cutoff_on(
         attendance.attendance_date,
@@ -78,8 +78,8 @@ def should_auto_stop_first_pass(attendance: AttendanceLog, now=None) -> bool:
 
 def should_auto_stop_final_pass(attendance: AttendanceLog, now=None) -> bool:
     """
-    9 PM: stop if inactive > 30 minutes.
-    From 10 PM onward: stop everyone still open (checkout recorded at 9 PM).
+    9 PM: checkout everyone still checked in (including those deferred from 8 PM
+    because they were active within the last 30 minutes).
     """
     now = now or timezone.now()
     final_cutoff = stop_cutoff_on(
@@ -87,13 +87,7 @@ def should_auto_stop_final_pass(attendance: AttendanceLog, now=None) -> bool:
         AUTO_STOP_FINAL_HOUR,
         AUTO_STOP_FINAL_MINUTE,
     )
-    hard_close = final_cutoff + AUTO_STOP_HARD_CLOSE_AFTER_FINAL
-
-    if now < final_cutoff:
-        return False
-    if now >= hard_close:
-        return True
-    return inactivity_duration(attendance, now) > AUTO_STOP_FINAL_INACTIVITY
+    return now >= final_cutoff
 
 
 def system_stop_cutoff(attendance: AttendanceLog, pass_label: str):
@@ -175,13 +169,7 @@ def decide_auto_stop(attendance: AttendanceLog, *, phase=None, now=None, force_f
     else:
         if not should_auto_stop_final_pass(attendance, now):
             return False, None, None, None
-        final_cutoff = stop_cutoff_on(
-            attendance.attendance_date,
-            AUTO_STOP_FINAL_HOUR,
-            AUTO_STOP_FINAL_MINUTE,
-        )
-        hard_close = final_cutoff + AUTO_STOP_HARD_CLOSE_AFTER_FINAL
-        pass_label = PASS_9PM_FORCED if now >= hard_close else PASS_9PM
+        pass_label = PASS_9PM
 
     system_stop_at = system_stop_cutoff(
         attendance,

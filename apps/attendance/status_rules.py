@@ -37,7 +37,7 @@ def resolve_work_day_status(
 
     Auto Stop (forgot check-out):
     - ≤5 h → Absent
-    - >5 h → Auto Stop Half Day (never Present/Overtime, even if 8+ h recorded)
+    - >5 h → Half Day (even if 8+ h recorded — no Present/Overtime on auto checkout)
     """
     del day
 
@@ -52,7 +52,7 @@ def resolve_work_day_status(
     if auto_checked_out:
         if hours <= ABSENT_MAX_HOURS:
             return "Absent"
-        return "Auto Stop Half Day"
+        return "Half Day"
 
     if hours <= ABSENT_MAX_HOURS:
         return "Absent"

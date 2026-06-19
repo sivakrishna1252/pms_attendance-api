@@ -7,10 +7,10 @@ from apps.attendance.services import run_scheduled_auto_stop_pass
 class Command(BaseCommand):
     help = (
         "Smart Auto Stop for open attendance sessions.\n"
-        "  --pass first  : 8 PM job (inactive > 1 hour)\n"
-        "  --pass final  : 9 PM job (inactive > 30 min, or force all)\n"
+        "  --pass first  : 8 PM — checkout if inactive 30+ minutes\n"
+        "  --pass final  : 9 PM — checkout all still checked in\n"
         "  --pass auto   : detect pass from current time (default)\n"
-        "Schedule: run at 20:00 with --pass first, and at 21:00 with --pass final."
+        "Schedule: run at 20:00 with --pass first, and at 21:00 with --pass final (Mon–Fri)."
     )
 
     def add_arguments(self, parser):
