@@ -47,6 +47,19 @@ docker compose -f docker-compose.prod.yml up -d --build
 
 **Jenkins:** run pipeline from `attendance_service/Jenkinsfile` (container `hrms-attendance-prod`, host port **6015**).
 
+## Evening auto-stop (Mon-Sat 8 PM IST)
+
+Production cron (PMS running tasks only):
+
+```bash
+chmod +x scripts/production/*.sh
+PMS_CONTAINER=pms-web-prod scripts/production/install-auto-stop-tasks-cron.sh
+```
+
+Logs: `/var/log/pms/auto-stop-tasks.log`. Jenkins `pms/Jenkinsfile` installs this after deploy.
+
+Local Windows: `powershell -ExecutionPolicy Bypass -File scripts/auto-stop-tasks.ps1 -Register`
+
 ## Nginx
 
 Point DNS `nexus-hrms.aspune.cloud` at your server, then proxy to `127.0.0.1:6015` (see `README.md` for sample config). Prefer HTTPS on nginx and include `https://…` entries in `CORS_ALLOWED_ORIGINS` for browser clients.

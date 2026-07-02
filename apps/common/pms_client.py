@@ -43,6 +43,35 @@ def _pms_get_json(path, *, timeout=3):
         return None
 
 
+def _pms_get_all_results(path, *, timeout=3, page_size=25):
+    """Follow paginated PMS internal list APIs and return all result rows."""
+    results = []
+    page = 1
+    normalized = path.strip("/")
+    while True:
+        body = _pms_get_json(
+            f"{normalized}/?page={page}&page_size={page_size}",
+            timeout=timeout,
+        )
+        if not isinstance(body, dict) or not body.get("success"):
+            return results or None
+
+        data = body.get("data") or {}
+        page_results = data.get("results") if isinstance(data, dict) else []
+        if not isinstance(page_results, list):
+            return results or None
+
+        results.extend(page_results)
+        meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+        total_pages = meta.get("total_pages")
+        if total_pages is None:
+            break
+        if page >= int(total_pages) or not page_results:
+            break
+        page += 1
+    return results
+
+
 def _pms_post_json(path, payload, *, timeout=10):
     base_url = getattr(settings, "PMS_API_BASE_URL", "") or ""
     authorization = service_authorization_header()
@@ -111,12 +140,9 @@ def employee_email(profile):
 
 def admin_users_from_pms():
     """Active PMS admin users (HTTP internal API, then PMS DB fallback)."""
-    body = _pms_get_json("internal/admin-users/")
-    if isinstance(body, dict) and body.get("success"):
-        data = body.get("data") or {}
-        results = data.get("results") if isinstance(data, dict) else []
-        if results:
-            return results
+    results = _pms_get_all_results("internal/admin-users/")
+    if results:
+        return results
 
     db_admins = admin_users_from_db()
     if db_admins:
@@ -153,10 +179,7 @@ def staff_users_from_pms():
     db_users = staff_users_from_db()
     if db_users:
         return db_users
-    body = _pms_get_json("internal/staff-users/")
-    if isinstance(body, dict) and body.get("success"):
-        data = body.get("data") or {}
-        results = data.get("results") if isinstance(data, dict) else []
-        if results:
-            return results
+    results = _pms_get_all_results("internal/staff-users/")
+    if results:
+        return results
     return []

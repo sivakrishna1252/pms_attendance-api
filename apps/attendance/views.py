@@ -11,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.authentication.permissions import IsAttendanceAdmin
+from apps.common.pagination import paginate_request, paginated_list_response
 from apps.common.employee_profiles import resolver_from_request, seed_staff_resolver
 from apps.common.pms_client import staff_users_from_pms
 from apps.leaves.models import LeaveRequest
@@ -1344,14 +1345,13 @@ class AttendanceHistoryAPIView(APIView):
             end_date=end_date,
         )
 
-        return Response(
-            {
-                "success": True,
-                "message": "Attendance history fetched successfully.",
-                "summary": history["summary"],
-                "period": history["period"],
-                "records": history["records"],
-            }
+        return paginated_list_response(
+            request,
+            history["records"],
+            message="Attendance history fetched successfully.",
+            list_key="records",
+            summary=history["summary"],
+            period=history["period"],
         )
 
 
@@ -1412,22 +1412,21 @@ class AdminAttendanceHistoryAPIView(APIView):
                 auth_token=auth_token,
                 staff_ids=staff_ids,
             )
-            return Response(
-                {
-                    "success": True,
-                    "message": "Admin attendance history fetched successfully.",
-                    "filters": {
-                        "employee_id": employee_id,
-                        "start_date": start_date,
-                        "end_date": end_date,
-                        "date": attendance_date,
-                        "check_in_filter": check_in_filter,
-                        "status_filter": status_filter,
-                    },
-                    "day_context": day_payload.get("day_context"),
-                    "summary": day_payload["summary"],
-                    "records": day_payload["records"],
-                }
+            return paginated_list_response(
+                request,
+                day_payload["records"],
+                message="Admin attendance history fetched successfully.",
+                list_key="records",
+                filters={
+                    "employee_id": employee_id,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "date": attendance_date,
+                    "check_in_filter": check_in_filter,
+                    "status_filter": status_filter,
+                },
+                day_context=day_payload.get("day_context"),
+                summary=day_payload["summary"],
             )
 
         if resolver:
@@ -1449,24 +1448,23 @@ class AdminAttendanceHistoryAPIView(APIView):
         extra_work = sum(1 for item in records if item["work_analysis"]["variance"] == "extra_work")
         less_work = sum(1 for item in records if item["work_analysis"]["variance"] == "less_work")
 
-        return Response(
-            {
-                "success": True,
-                "message": "Admin attendance history fetched successfully.",
-                "filters": {
-                    "employee_id": employee_id,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "date": attendance_date,
-                    "check_in_filter": check_in_filter,
-                },
-                "summary": {
-                    **build_history_summary(attendance),
-                    "extra_work_days": extra_work,
-                    "less_work_days": less_work,
-                },
-                "records": records,
-            }
+        return paginated_list_response(
+            request,
+            records,
+            message="Admin attendance history fetched successfully.",
+            list_key="records",
+            filters={
+                "employee_id": employee_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "date": attendance_date,
+                "check_in_filter": check_in_filter,
+            },
+            summary={
+                **build_history_summary(attendance),
+                "extra_work_days": extra_work,
+                "less_work_days": less_work,
+            },
         )
 
 
@@ -1511,34 +1509,64 @@ class AdminDashboardAPIView(APIView):
             ).count(),
         }
 
+        pending_requests = [
+            leave_card(item, resolver)
+            for item in LeaveRequest.objects.filter(status=LeaveRequest.Status.PENDING).order_by(
+                "-created_at"
+            )
+        ]
+        recent_approved = [
+            leave_card(item, resolver)
+            for item in retained_leaves.filter(status=LeaveRequest.Status.APPROVED).order_by(
+                "-approved_at"
+            )
+        ]
+        recent_rejected = [
+            leave_card(item, resolver)
+            for item in retained_leaves.filter(status=LeaveRequest.Status.REJECTED).order_by(
+                "-approved_at"
+            )
+        ]
+
+        pending_page, pending_paginator = paginate_request(request, pending_requests)
+        approved_page, approved_paginator = paginate_request(request, recent_approved)
+        rejected_page, rejected_paginator = paginate_request(request, recent_rejected)
+
+        attendance_records = day_payload["attendance_today"].get("records") or []
+        attendance_page, attendance_paginator = paginate_request(request, attendance_records)
+
         return Response(
             {
                 "success": True,
                 "message": "Admin dashboard fetched successfully.",
                 "date": dashboard_date.isoformat(),
                 "day_context": day_payload.get("day_context"),
-                "attendance_today": day_payload["attendance_today"],
+                "attendance_today": {
+                    **day_payload["attendance_today"],
+                    "records": attendance_page if attendance_page is not None else attendance_records,
+                },
                 "summary": day_payload["summary"],
                 "leaves": {
                     "pending_count": leave_counts[LeaveRequest.Status.PENDING],
                     "approved_count": leave_counts[LeaveRequest.Status.APPROVED],
                     "rejected_count": leave_counts[LeaveRequest.Status.REJECTED],
-                    "pending_requests": [
-                        leave_card(item, resolver)
-                        for item in LeaveRequest.objects.filter(status=LeaveRequest.Status.PENDING)[:20]
-                    ],
-                    "recent_approved": [
-                        leave_card(item, resolver)
-                        for item in retained_leaves.filter(
-                            status=LeaveRequest.Status.APPROVED
-                        ).order_by("-approved_at")[:10]
-                    ],
-                    "recent_rejected": [
-                        leave_card(item, resolver)
-                        for item in retained_leaves.filter(
-                            status=LeaveRequest.Status.REJECTED
-                        ).order_by("-approved_at")[:10]
-                    ],
+                    "pending_requests": pending_page if pending_page is not None else pending_requests,
+                    "recent_approved": approved_page if approved_page is not None else recent_approved,
+                    "recent_rejected": rejected_page if rejected_page is not None else recent_rejected,
+                },
+                "meta": {
+                    "attendance_records": (
+                        attendance_paginator._meta_payload() if attendance_paginator is not None else None
+                    ),
+                    "pending_requests": (
+                        pending_paginator._meta_payload() if pending_paginator is not None else None
+                    ),
+                    "recent_approved": (
+                        approved_paginator._meta_payload() if approved_paginator is not None else None
+                    ),
+                    "recent_rejected": (
+                        rejected_paginator._meta_payload() if rejected_paginator is not None else None
+                    ),
                 },
             }
         )

@@ -11,6 +11,7 @@ from rest_framework.views import APIView
 from apps.attendance.calendar import REPORT_RETENTION_MONTHS, resolve_report_date_range
 from apps.attendance.models import AttendanceLog
 from apps.attendance.views import format_time, parse_staff_ids_param
+from apps.common.pagination import paginate_request
 from apps.authentication.permissions import IsAttendanceAdmin
 from apps.common.employee_profiles import resolver_from_request, seed_staff_resolver
 from apps.leaves.models import LeaveRequest
@@ -319,7 +320,8 @@ class AttendanceReportsAPIView(APIView):
             report_title = "Attendance Summary"
 
         export_rows = full_rows[:EXPORT_ROW_LIMIT]
-        preview_rows = full_rows[:PREVIEW_ROW_LIMIT]
+        preview_page, preview_paginator = paginate_request(request, full_rows)
+        preview_rows = preview_page if preview_page is not None else full_rows[:PREVIEW_ROW_LIMIT]
         if report_type == REPORT_TYPE_ATTENDANCE and attendance_status_totals is not None:
             export_rows = export_rows + [build_attendance_summary_row(attendance_status_totals)]
 
@@ -392,5 +394,6 @@ class AttendanceReportsAPIView(APIView):
                     "leave_requests_by_status": leave_summary,
                     "leave_days_by_status": leave_days_by_status,
                 },
+                "meta": preview_paginator._meta_payload() if preview_paginator is not None else None,
             }
         )

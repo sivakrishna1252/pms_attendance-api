@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.attendance.views import employee_id_from_request
+from apps.common.pagination import paginate_request, paginated_list_response
 from apps.authentication.permissions import IsAttendanceAdmin
 from apps.common.employee_profiles import resolver_from_request, seed_staff_resolver
 
@@ -281,14 +282,14 @@ class LeaveHistoryAPIView(APIView):
         if status_filter in LeaveRequest.Status.values:
             leave_requests = leave_requests.filter(status=status_filter)
         balance = get_or_create_leave_balance(employee_id)
-        return Response(
-            {
-                "success": True,
-                "message": "Leave history fetched successfully.",
-                "retention_months": LEAVE_HISTORY_RETENTION_MONTHS,
-                "balances": balance_cards(balance),
-                "requests": [leave_card(item) for item in leave_requests],
-            }
+        request_cards = [leave_card(item) for item in leave_requests]
+        return paginated_list_response(
+            request,
+            request_cards,
+            message="Leave history fetched successfully.",
+            list_key="requests",
+            retention_months=LEAVE_HISTORY_RETENTION_MONTHS,
+            balances=balance_cards(balance),
         )
 
 
@@ -321,12 +322,12 @@ class HolidayListAPIView(APIView):
         holidays = upcoming_holidays()
         if year and year.isdigit():
             holidays = Holiday.objects.filter(is_active=True, holiday_date__year=int(year)).order_by("holiday_date")
-        return Response(
-            {
-                "success": True,
-                "message": "Holidays fetched successfully.",
-                "holidays": [holiday_card(item) for item in holidays],
-            }
+        holiday_items = [holiday_card(item) for item in holidays]
+        return paginated_list_response(
+            request,
+            holiday_items,
+            message="Holidays fetched successfully.",
+            list_key="holidays",
         )
 
 
@@ -342,13 +343,13 @@ class PendingLeaveRequestsAPIView(APIView):
         resolver = resolver_from_request(request)
         seed_staff_resolver(resolver, token=request.headers.get("Authorization"))
         pending = list(_pending_leave_requests_qs().order_by("-created_at"))
-        return Response(
-            {
-                "success": True,
-                "message": "Pending leave requests fetched successfully.",
-                "pending_count": len(pending),
-                "requests": [leave_card(item, resolver) for item in pending],
-            }
+        pending_cards = [leave_card(item, resolver) for item in pending]
+        return paginated_list_response(
+            request,
+            pending_cards,
+            message="Pending leave requests fetched successfully.",
+            list_key="requests",
+            pending_count=len(pending),
         )
 
 
@@ -379,14 +380,14 @@ class AdminLeaveListAPIView(APIView):
         ).annotate(total=Count("id")):
             counts[row["status"]] = row["total"]
 
-        return Response(
-            {
-                "success": True,
-                "message": "Leave requests fetched successfully.",
-                "retention_months": LEAVE_HISTORY_RETENTION_MONTHS,
-                "counts": counts,
-                "requests": [leave_card(item, resolver) for item in leave_requests[:200]],
-            }
+        request_cards = [leave_card(item, resolver) for item in leave_requests]
+        return paginated_list_response(
+            request,
+            request_cards,
+            message="Leave requests fetched successfully.",
+            list_key="requests",
+            retention_months=LEAVE_HISTORY_RETENTION_MONTHS,
+            counts=counts,
         )
 
 
@@ -515,14 +516,17 @@ class AdminHolidayListCreateAPIView(APIView):
                         }
                     )
 
-        return Response(
-            {
-                "success": True,
-                "message": "Holidays fetched successfully.",
-                "admin_holidays": admin_holidays,
-                "recurring_holidays": recurring,
-            }
-        )
+        admin_page, admin_paginator = paginate_request(request, admin_holidays)
+        paged_admin_holidays = admin_page if admin_page is not None else admin_holidays
+        payload = {
+            "success": True,
+            "message": "Holidays fetched successfully.",
+            "admin_holidays": paged_admin_holidays,
+            "recurring_holidays": recurring,
+        }
+        if admin_paginator is not None:
+            payload["meta"] = admin_paginator._meta_payload()
+        return Response(payload)
 
     @extend_schema(
         tags=["Admin Holidays"],
